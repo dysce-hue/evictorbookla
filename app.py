@@ -1168,7 +1168,7 @@ with tab_trend:
             textposition="top center",
         )
         fig.update_layout(
-            height=360,
+            height=430,
             margin=dict(l=40, r=20, t=60, b=40),
             yaxis_title="Number of Evictions",
             yaxis_tickformat=",.0f",
@@ -1203,7 +1203,7 @@ with tab_cpi:
                 textposition="top center",
             )
             fig.update_layout(
-                height=360,
+                height=430,
                 margin=dict(l=40, r=20, t=60, b=40),
                 yaxis_title="CPI (Rent Index)",
                 yaxis_tickformat=",.1f",
