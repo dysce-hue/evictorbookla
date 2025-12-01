@@ -22,7 +22,7 @@ NBHD_SHP = os.path.join(DATA_DIR, "8494cd42-db48-4af1-a215-a2c8f61e96a22020328-1
 # Optional pre-aggregated census file
 NEIGHBORHOOD_CENSUS_CSV = os.path.join(DATA_DIR, "neighborhood_census.csv")
 
-# FRED CPI config (same series as Shiny)
+# FRED CPI config 
 FRED_API_KEY = "e96136ab46ba35fca84c640ca9873d86"
 FRED_SERIES_ID = "CUSR0000SA0L2"  # rent of primary residence
 
@@ -307,7 +307,7 @@ st.markdown(
 )
 st.caption(
     "Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed "
-    "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array."
+    "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array. "
     "The following map is still a work in progress. Future Content: Methodology Tab, Neighborhood Data Overlays, Inferential Statistics, Upgraded UI, more up-to-date eviction data, and further information on corporate parcel ownership of units." 
 )
 
@@ -741,7 +741,7 @@ html_template = """
   // Download selected features as CSV
   function downloadSelectedAsCSV() {
     if (!lastSelectedFeatures.length) {
-      alert("No selected nodes to download. Draw a polygon first.");
+      alert("No selected evictions to download. Draw a polygon first.");
       return;
     }
 
@@ -1116,7 +1116,7 @@ if not ev_selected.empty:
     with sel_cols[0]:
         st.metric("Selected Units", f"{sel_units:,}")
     with sel_cols[1]:
-        st.metric("Selected Nodes", f"{sel_nodes:,}")
+        st.metric("Selected Evictions", f"{sel_nodes:,}")
     with sel_cols[2]:
         st.metric("Selected Rent Owed", f"${sel_rent:,.0f}")
 else:
@@ -1238,7 +1238,7 @@ with tab_hist:
             height=430,
             margin=dict(l=70, r=20, t=70, b=60),
             xaxis_tickformat="$,.0f",
-            yaxis_title="Number of Nodes",
+            yaxis_title="Number of Separate Eviction Addresses",
         )
         st.plotly_chart(fig, use_container_width=True)
 
