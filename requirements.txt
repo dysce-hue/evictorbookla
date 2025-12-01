@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+geopandas
+requests
+plotly
+pyproj
+shapely
+rtree
