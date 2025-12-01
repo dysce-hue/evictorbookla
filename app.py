@@ -1235,7 +1235,7 @@ with tab_hist:
         )
         fig.update_layout(
             height=370,
-            margin=dict(l=40, r=20, t=70, b=40),
+            margin=dict(l=70, r=20, t=70, b=60),
             xaxis_tickformat="$,.0f",
             yaxis_title="Number of Nodes",
         )
