@@ -1222,26 +1222,30 @@ with tab_hist:
         cutoff = df_hist["Total_Rent_Owed"].quantile(0.95)
         df_hist = df_hist[df_hist["Total_Rent_Owed"] <= cutoff]
 
-         fig = px.histogram(
+        # Add text labels to bars
+        fig = px.histogram(
             df_hist,
             x="Total_Rent_Owed",
             nbins=40,
             labels={"Total_Rent_Owed": "Total Rent Owed ($)"},
             text_auto=True,   # show counts on top of bars
         )
-        
-        fig.update_traces(
-            texttemplate="%{y}",
-            textposition="outside",
-        )
-        fig.update_layout(
-            height=370,
-            margin=dict(l=70, r=20, t=70, b=60),
-            xaxis_tickformat="$,.0f",
-            yaxis_title="Number of Nodes",
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
+        # Give the y-axis extra headroom so labels aren’t cut off
+        if fig.data and len(fig.data[0]["y"]) > 0:
+            y_vals = fig.data[0]["y"]
+            y_max = max(y_vals)
+            fig.update_yaxes(range=[0, y_max * 1.2])  # 20% padding
+
+        fig.update_layout(
+            height=400,
+            margin=dict(l=80, r=40, t=80, b=70),
+            xaxis_tickformat="$,.0f",
+        )
+        fig.update_yaxes(automargin=True)
+
+        st.plotly_chart(fig, use_container_width=True)
+        
 # --- Eviction Causes Pie ---
 with tab_causes:
     st.subheader("Eviction Cause Breakdown (filtered set)")
