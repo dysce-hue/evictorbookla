@@ -1293,13 +1293,33 @@ with tab_demo:
             "White_share, Black_share, Hispanic_share, Asian_share, Other_share`."
         )
     else:
+        # Build dropdown options: special "All Areas" + all individual neighborhoods
+        area_options = ["All Areas (Los Angeles)"] + sorted(
+            census_df["name"].unique().tolist()
+        )
+
+        # Default selection: if current map area is a neighborhood in census_df, use that
+        default_index = 0
         if selected_area in census_df["name"].values:
-            row = census_df[census_df["name"] == selected_area].iloc[0]
+            try:
+                default_index = area_options.index(selected_area)
+            except ValueError:
+                default_index = 0
+
+        demo_area = st.selectbox(
+            "Select area for demographics",
+            options=area_options,
+            index=default_index,
+        )
+
+        # If user picks the special "All Areas" option, compute an aggregate row
+        if demo_area == "All Areas (Los Angeles)":
+            # Take simple (unweighted) averages for numeric columns
+            numeric_cols = census_df.select_dtypes(include=[np.number]).columns
+            agg_series = census_df[numeric_cols].mean()
+            agg_series["name"] = "All Areas (Los Angeles)"
+            row = agg_series
         else:
-            demo_area = st.selectbox(
-                "Select neighborhood for demographics",
-                options=sorted(census_df["name"].unique().tolist()),
-            )
             row = census_df[census_df["name"] == demo_area].iloc[0]
 
         st.markdown(f"**Area:** `{row['name']}`")
@@ -1322,10 +1342,11 @@ with tab_demo:
         existing_race_cols = [c for c in race_cols if c in row.index]
         if existing_race_cols:
             race_vals = [row[c] for c in existing_race_cols]
-            race_labels = [c.replace("_share", "").replace("_", " ") for c in existing_race_cols]
-            race_df = pd.DataFrame(
-                {"group": race_labels, "share": race_vals}
-            )
+            race_labels = [
+                c.replace("_share", "").replace("_", " ")
+                for c in existing_race_cols
+            ]
+            race_df = pd.DataFrame({"group": race_labels, "share": race_vals})
 
             race_colors = {
                 "White": "#9ecae1",
@@ -1348,3 +1369,4 @@ with tab_demo:
             st.plotly_chart(fig_demo, use_container_width=True)
         else:
             st.info("No racial composition columns found in census file.")
+
