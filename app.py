@@ -1222,11 +1222,12 @@ with tab_hist:
         cutoff = df_hist["Total_Rent_Owed"].quantile(0.95)
         df_hist = df_hist[df_hist["Total_Rent_Owed"] <= cutoff]
 
-        fig = px.histogram(
+         fig = px.histogram(
             df_hist,
             x="Total_Rent_Owed",
             nbins=40,
             labels={"Total_Rent_Owed": "Total Rent Owed ($)"},
+            text_auto=True,   # show counts on top of bars
         )
         
         fig.update_traces(
