@@ -1361,7 +1361,7 @@ with tab_demo:
                 race_df,
                 names="group",
                 values="share",
-                title="Racial/Ethnic Composition of neighboorhood (share of population seperate from rent and evictions)",
+                title="Racial/Ethnic Composition of area (separate from rent and evictions data)",
                 color="group",
                 color_discrete_map=race_colors,
             )
