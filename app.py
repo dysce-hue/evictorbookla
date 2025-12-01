@@ -301,7 +301,10 @@ subdiv_minus = compute_subdiv_minus_neighborhood()
 cpi_df = load_cpi()
 census_df = load_neighborhood_census()
 
-st.title("EvictorBookLA — 3D Map")
+st.markdown(
+    "<h1 style='font-size: 2.5rem; font-weight: 700;'>EvictorBookLA — 3D Map</h1>",
+    unsafe_allow_html=True,
+)
 st.caption(
     "Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed "
     "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array."
