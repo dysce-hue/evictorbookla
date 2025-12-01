@@ -289,7 +289,7 @@ def load_neighborhood_census():
 # STREAMLIT APP LAYOUT
 # ==============================
 st.set_page_config(
-    page_title="EvictorBookLA 3D",
+    page_title="EvictorBookLA 3D (WIP)",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -1135,7 +1135,7 @@ tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
         " CPI & Rent Index",
         " Rent Owed Histogram",
         " Eviction Causes",
-        " Demographics (Census)",
+        " Demographics (Census Data)",
     ]
 )
 
@@ -1283,7 +1283,7 @@ with tab_causes:
 
 # --- Demographics (Census) ---
 with tab_demo:
-    st.subheader("Neighborhood Demographics (Census)")
+    st.subheader("Neighborhood Demographic Based on Census Data (Irrespective of Evictions)")
 
     if census_df.empty:
         st.info(
