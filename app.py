@@ -304,7 +304,7 @@ census_df = load_neighborhood_census()
 st.title("EvictorBookLA — 3D Map")
 st.caption(
     "Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed "
-    "Scroll, pan, zoom, click points, and draw polygons to select nodes."
+    "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array."
 )
 
 if evictions.empty:
