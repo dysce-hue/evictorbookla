@@ -269,7 +269,7 @@ def load_cpi():
         return pd.DataFrame(columns=["date", "value"])
 
 # ==============================
-# DATA LOADING — CENSUS (OPTIONAL)
+# DATA LOADING — CENSUS
 # ==============================
 @st.cache_data
 def load_neighborhood_census():
@@ -302,12 +302,13 @@ cpi_df = load_cpi()
 census_df = load_neighborhood_census()
 
 st.markdown(
-    "<h1 style='font-size: 2.5rem; font-weight: 700;'>EvictorBookLA — 3D Map</h1>",
+    "<h1 style='font-size: 2.5rem; font-weight: 700;'>EvictorBookLA — 3D Map (WIP)</h1>",
     unsafe_allow_html=True,
 )
 st.caption(
     "Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed "
     "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array."
+    "The following map is still a work in progress. Future Content: Methodology Tab, Neighborhood Data Overlays, Inferential Statistics, Upgraded UI, more up-to-date eviction data, and further information on corporate parcel ownership of units." 
 )
 
 if evictions.empty:
@@ -1328,7 +1329,7 @@ with tab_demo:
         with cols_demo[0]:
             if "rent_burden_pct" in row:
                 st.metric(
-                    "Severely Rent-Burdened (≥50%)",
+                    "Severely Rent-Burdened (≥50%) *paying over 50% of income on rent*",
                     f"{row['rent_burden_pct']:.1f}%",
                 )
 
@@ -1360,7 +1361,7 @@ with tab_demo:
                 race_df,
                 names="group",
                 values="share",
-                title="Racial/Ethnic Composition (share of population)",
+                title="Racial/Ethnic Composition of neighboorhood (share of population seperate from rent and evictions)",
                 color="group",
                 color_discrete_map=race_colors,
             )
