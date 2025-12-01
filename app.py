@@ -303,7 +303,7 @@ census_df = load_neighborhood_census()
 
 st.title("EvictorBookLA — 3D Map")
 st.caption(
-    "Use the sidebar filters, then explore the 3D eviction map below. "
+    "Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed "
     "Scroll, pan, zoom, click points, and draw polygons to select nodes."
 )
 
