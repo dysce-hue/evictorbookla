@@ -52,7 +52,7 @@ def load_evictions(path):
         if col in df.columns:
             df[col] = df[col].astype(str).fillna("")
 
-    # Clean Rent Owed → numeric
+    # Clean Rent Owed  numeric
     if "Rent Owed" in df.columns:
         df["Rent_Owed_num"] = (
             df["Rent Owed"]
@@ -301,7 +301,7 @@ subdiv_minus = compute_subdiv_minus_neighborhood()
 cpi_df = load_cpi()
 census_df = load_neighborhood_census()
 
-st.title("EvictorBookLA — 3D Map & Analytics")
+st.title("EvictorBookLA — 3D Map")
 st.caption(
     "Use the sidebar filters, then explore the 3D eviction map below. "
     "Scroll, pan, zoom, click points, and draw polygons to select nodes."
@@ -465,7 +465,7 @@ html_template = """
     font: 12px/1.4 'Helvetica Neue', Arial, Helvetica, sans-serif;
   }
 
-  /* Address search bar (top-center so it doesn't overlap draw or nav controls) */
+  /* Address search bar  */
   #search-container {
     position: absolute;
     top: 10px;
@@ -500,7 +500,7 @@ html_template = """
     background: #e2e2e2;
   }
 
-  /* Selection info panel (bottom-right, nudged up 15px) */
+  /* Selection info panel */
   #selection-panel {
     position: absolute;
     bottom: 25px;
@@ -1124,7 +1124,7 @@ st.write(f"**Area filter:** {selected_area}")
 st.markdown("---")
 
 # ==============================
-# ANALYTICS TABS (Shiny-style)
+# ANALYTICS TABS 
 # ==============================
 tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
     [
@@ -1158,7 +1158,7 @@ with tab_trend:
             markers=True,
             labels={"month": "Month", "evictions": "Number of Evictions"},
         )
-        # Show numeric values on the line
+        
         fig.update_traces(
             mode="lines+markers+text",
             text=trend["evictions"],
@@ -1193,7 +1193,7 @@ with tab_cpi:
                 markers=True,
                 labels={"date": "Date", "value": "CPI (Rent Index)"},
             )
-            # Show numeric CPI values
+            
             fig.update_traces(
                 mode="lines+markers+text",
                 text=sub_cpi["value"].round(1),
@@ -1225,7 +1225,7 @@ with tab_hist:
             nbins=40,
             labels={"Total_Rent_Owed": "Total Rent Owed ($)"},
         )
-        # Show counts above bars
+        
         fig.update_traces(
             texttemplate="%{y}",
             textposition="outside",
