@@ -430,7 +430,7 @@ if evictions.empty:
 # ==============================
 st.sidebar.image(
     "la_logo.png",
-    width=100,         
+    width=80,         
     use_column_width=False
 )
 st.sidebar.header("EvictorBookLA")
@@ -446,7 +446,7 @@ st.sidebar.markdown(
     .sidebar-creator-badge {
         position: absolute;
         left: 10px;
-        bottom: 10px;
+        bottom: 1000px;
         padding: 4px 10px;
         border-radius: 999px;
         font-size: 11px;
