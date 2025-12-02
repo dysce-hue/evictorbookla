@@ -435,9 +435,6 @@ st.sidebar.image(
 )
 st.sidebar.header("EvictorBookLA")
 
-
-
-
 min_date = evictions["Date_Filed"].min()
 max_date = evictions["Date_Filed"].max()
 
