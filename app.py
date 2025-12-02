@@ -52,7 +52,7 @@ def load_evictions(path):
         if col in df.columns:
             df[col] = df[col].astype(str).fillna("")
 
-    # Clean Rent Owed  numeric
+    # Clean Rent Owed numeric
     if "Rent Owed" in df.columns:
         df["Rent_Owed_num"] = (
             df["Rent Owed"]
@@ -294,12 +294,95 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.markdown(
+    """
+    <style>
+    /* Make the sidebar header (EvictorBookLA) larger and bolder */
+    section[data-testid="stSidebar"] h2 {
+        font-size: 2.0rem !important;   /* tweak this value */
+        font-weight: 800 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 evictions = load_evictions(EVICTION_CSV)
 subdiv = load_subdivisions()
 nbhd = load_neighborhoods()
 subdiv_minus = compute_subdiv_minus_neighborhood()
 cpi_df = load_cpi()
 census_df = load_neighborhood_census()
+
+# ==============================
+# BUILD NEIGHBORHOOD CHOROPLETH GEOJSON
+# ==============================
+nbhd_choro_json = "null"
+
+if not nbhd.empty and not census_df.empty:
+    # Join neighborhood geometries with census metrics
+    nbhd_demo = nbhd.merge(census_df, on="name", how="left")
+
+    # Optional: CPI-adjusted median income (rough “real income index”)
+    if not cpi_df.empty and "median_income" in nbhd_demo.columns:
+        latest_cpi = cpi_df["value"].iloc[-1]
+        if pd.notna(latest_cpi) and latest_cpi != 0:
+            nbhd_demo["median_income_cpi_adj"] = nbhd_demo["median_income"] / latest_cpi
+
+    # To be safe, fill NaNs for numeric choropleth fields
+    for col in ["median_income", "median_income_cpi_adj", "rent_burden_pct"]:
+        if col in nbhd_demo.columns:
+            nbhd_demo[col] = pd.to_numeric(nbhd_demo[col], errors="coerce").fillna(0.0)
+
+    # --- NEW: total evictions per neighborhood (using full eviction dataset) ---
+    try:
+        if not evictions.empty:
+            # Eviction points as GeoDataFrame
+            ev_gdf = gpd.GeoDataFrame(
+                evictions.copy(),
+                geometry=gpd.points_from_xy(evictions["long"], evictions["lat"]),
+                crs="EPSG:4326",
+            )
+
+            # Neighborhoods are already EPSG:4326 from load_neighborhoods()
+            nbhd_4326 = nbhd.to_crs(epsg=4326)
+
+            joined = gpd.sjoin(
+                ev_gdf,
+                nbhd_4326[["name", "geometry"]],
+                how="inner",
+                predicate="within",
+            )
+
+            # Sum Eviction_Count per neighborhood
+            ev_agg = (
+                joined.groupby("name", as_index=False)["Eviction_Count"]
+                .sum()
+                .rename(columns={"Eviction_Count": "evictions_total"})
+            )
+
+            # Attach to nbhd_demo (so features have both ACS + evictions_total)
+            nbhd_demo = nbhd_demo.merge(ev_agg, on="name", how="left")
+            nbhd_demo["evictions_total"] = (
+                nbhd_demo["evictions_total"].fillna(0).astype(float)
+            )
+    except Exception as e:
+        st.warning(f"Could not compute total evictions per neighborhood: {e}")
+
+    # Convert to GeoJSON string for Mapbox
+    nbhd_choro_json = nbhd_demo.to_json()
+
+# ------------------------------
+# INTERACTIVE CHART FILTER STATE
+# ------------------------------
+if "trend_filter" not in st.session_state:
+    st.session_state["trend_filter"] = None  # (start_ts, end_ts) for a month
+if "rent_filter" not in st.session_state:
+    st.session_state["rent_filter"] = None   # (min_rent, max_rent) for histogram selection
+
+def clear_chart_filters():
+    st.session_state["trend_filter"] = None
+    st.session_state["rent_filter"] = None
 
 st.markdown(
     "<h1 style='font-size: 2.5rem; font-weight: 700;'>EvictorBookLA — 3D Map (WIP)</h1>",
@@ -317,6 +400,11 @@ if evictions.empty:
 # ==============================
 # SIDEBAR FILTERS
 # ==============================
+st.sidebar.image(
+    "la_logo.png",
+    width=120,         
+    use_column_width=False
+)
 st.sidebar.header("EvictorBookLA")
 
 min_date = evictions["Date_Filed"].min()
@@ -358,6 +446,8 @@ selected_area = st.sidebar.selectbox(
     index=0,
 )
 
+st.sidebar.button("Clear Chart-Based Filters", on_click=clear_chart_filters)
+
 # ==============================
 # FILTER DATA IN PYTHON
 # ==============================
@@ -368,6 +458,24 @@ mask_count = evictions["Eviction_Count"] >= min_evict_count
 
 ev_filtered = evictions.loc[mask_date & mask_count].copy()
 ev_filtered = filter_by_area(ev_filtered, selected_area, subdiv, nbhd, subdiv_minus)
+
+# ---- Extra interactive filters from charts ----
+trend_filter = st.session_state.get("trend_filter")
+if trend_filter is not None:
+    t_start, t_end = trend_filter
+    ev_filtered = ev_filtered[
+        (ev_filtered["Date_Filed"] >= t_start)
+        & (ev_filtered["Date_Filed"] < t_end)
+    ]
+
+rent_filter = st.session_state.get("rent_filter")
+if rent_filter is not None:
+    r_min, r_max = rent_filter
+    if "Total_Rent_Owed" in ev_filtered.columns:
+        ev_filtered = ev_filtered[
+            (ev_filtered["Total_Rent_Owed"] >= r_min)
+            & (ev_filtered["Total_Rent_Owed"] <= r_max)
+        ]
 
 if ev_filtered.empty:
     st.warning("No evictions in this date range / filter / area.")
@@ -429,6 +537,13 @@ records = ev_js[
 ].to_dict(orient="records")
 
 evictions_json = json.dumps(records)
+
+# --- Neighborhood GeoJSON for base overlay ---
+if not nbhd.empty:
+    nbhd_export = nbhd[["name", "geometry"]].copy()
+    nbhd_geojson = nbhd_export.to_json()
+else:
+    nbhd_geojson = json.dumps({"type": "FeatureCollection", "features": []})
 
 # ==============================
 # EMBEDDED HTML: MAPBOX GL JS + DRAW
@@ -504,6 +619,23 @@ html_template = """
     background: #e2e2e2;
   }
 
+  /* Choropleth overlay controls */
+  #choropleth-controls {
+    position: absolute;
+    top: 60px;
+    left: 10px;
+    z-index: 3;
+    background: rgba(255, 255, 255, 0.96);
+    border-radius: 4px;
+    box-shadow: 0 0 6px rgba(0,0,0,0.25);
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+  #choropleth-select {
+    margin-left: 4px;
+    font-size: 11px;
+  }
+
   /* Selection info panel */
   #selection-panel {
     position: absolute;
@@ -542,6 +674,23 @@ html_template = """
   #download-selected-btn:hover {
     background: #e6e6e6;
   }
+
+  /* Neighborhood hover info (bottom-left) */
+  #nbhd-info-panel {
+    position: absolute;
+    bottom: 10px;
+    left: 10px;
+    max-width: 260px;
+    background: rgba(255, 255, 255, 0.96);
+    border-radius: 4px;
+    box-shadow: 0 0 6px rgba(0,0,0,0.25);
+    padding: 6px 8px;
+    font-size: 11px;
+    z-index: 3;
+  }
+  #nbhd-info-panel b {
+    font-size: 12px;
+  }
 </style>
 </head>
 <body>
@@ -553,10 +702,22 @@ html_template = """
   <button id="address-search-btn" type="button">Go</button>
 </div>
 
+<!-- Choropleth overlay controls -->
+<div id="choropleth-controls">
+  <label for="choropleth-select">Overlay:</label>
+  <select id="choropleth-select">
+    <option value="none" selected>No overlay</option>
+    <option value="evictions_total">Total evictions (all years)</option>
+    <option value="median_income">Median income</option>
+    <option value="rent_burden_pct">Severe rent burden ≥50%</option>
+  </select>
+</div>
+
+
 <div id="selection-panel">
   <h4>Selection</h4>
   <small>
-    Draw a polygon with the <b>polygon tool</b> (top-left) to select nodes.
+    Draw a polygon with the <b>polygon tool</b> (top-left) to encapture data nodes.
   </small>
   <div id="selection-summary" style="margin-top:6px;">
     No selection yet.
@@ -567,33 +728,71 @@ html_template = """
   <ol id="selection-list"></ol>
 </div>
 
+<!-- Neighborhood hover info panel (bottom-left) -->
+<div id="nbhd-info-panel">
+  <div id="nbhd-info-content">
+    Hover over a shaded neighborhood to view total evictions, median income, and severe rent burden.
+  </div>
+</div>
+
 <script>
   mapboxgl.accessToken = "MAPBOX_TOKEN_PLACEHOLDER";
 
   // Eviction data from Streamlit
   const evictions = EVIC_DATA_PLACEHOLDER;
 
+  // Neighborhood choropleth data (census + CPI-adjusted income, etc.)
+  const nbhdChoro = NBHD_CHORO_PLACEHOLDER;
+
+  // Neighborhood polygons from Streamlit (basic outline)
+  const neighborhoods = NBHD_DATA_PLACEHOLDER;
+
   // Build GeoJSON with clustering enabled
-  const evictionGeojson = {
-    "type": "FeatureCollection",
-    "features": evictions.map((e) => ({
-      "type": "Feature",
-      "properties": {
-        id: e.js_id,
-        full_address: e.full_address,
-        date_filed: e.Date_Filed_str,
-        eviction_count: e.Eviction_Count,
-        cause: e.Cause,
-        council_district: e.Council_District,
-        total_rent_owed: e.Total_Rent_Owed,
-        apn: e.Apn
-      },
-      "geometry": {
-        "type": "Point",
-        "coordinates": [e.long, e.lat]
-      }
-    }))
+  // Build GeoJSON with slight jitter for identical coordinates
+const jitterTracker = {};
+const evictionFeatures = evictions.map((e) => {
+  const baseLng = e.long;
+  const baseLat = e.lat;
+
+  // Key rounded to ~meter level to group "same" coordinates
+  const key = `${baseLng.toFixed(5)}|${baseLat.toFixed(5)}`;
+  const count = (jitterTracker[key] || 0);
+  jitterTracker[key] = count + 1;
+
+  // First point stays in place; others spiral out slightly
+  let lng = baseLng;
+  let lat = baseLat;
+  if (count > 0) {
+    const angle = (count * 2 * Math.PI) / 24;     // 8 petals around
+    const radius = 0.00000225 * count;              // ~10–15m per step
+    lng = baseLng + Math.cos(angle) * radius;
+    lat = baseLat + Math.sin(angle) * radius;
+  }
+
+  return {
+    "type": "Feature",
+    "properties": {
+      id: e.js_id,
+      full_address: e.full_address,
+      date_filed: e.Date_Filed_str,
+      eviction_count: e.Eviction_Count,
+      cause: e.Cause,
+      council_district: e.Council_District,
+      total_rent_owed: e.Total_Rent_Owed,
+      apn: e.Apn
+    },
+    "geometry": {
+      "type": "Point",
+      "coordinates": [lng, lat]
+    }
   };
+});
+
+const evictionGeojson = {
+  "type": "FeatureCollection",
+  "features": evictionFeatures
+};
+
 
   // Center the map above Los Angeles (fixed default)
   const map = new mapboxgl.Map({
@@ -618,7 +817,7 @@ html_template = """
           polygon: true,
           trash: true
         },
-        defaultMode: "draw_polygon"
+        defaultMode: "simple_select"
       });
       map.addControl(draw, "top-left");
     }
@@ -658,7 +857,7 @@ html_template = """
 
     summaryDiv.innerHTML = `
       <b>Selected nodes:</b> ${nodeCount.toLocaleString()}<br/>
-      <b>Approx. units (sum of Eviction_Count):</b> ${unitCount.toLocaleString()}<br/>
+      <b>Approx Tenants Evicted (sum of Tenant Evictions):</b> ${unitCount.toLocaleString()}<br/>
       <b>Total rent owed (approx):</b> $${totalRent.toLocaleString("en-US", {
         maximumFractionDigits: 0
       })}<br/>
@@ -836,7 +1035,7 @@ html_template = """
       <div style="font-size:12px;line-height:1.4">
         <strong>Address:</strong> ${props.full_address}<br/>
         <strong>Date Filed:</strong> ${props.date_filed}<br/>
-        <strong>Eviction Count:</strong> ${props.eviction_count}<br/>
+        <strong>Tenants Evicted:</strong> ${props.eviction_count}<br/>
         <strong>Cause:</strong> ${props.cause || "N/A"}<br/>
         <strong>Council District:</strong> ${props.council_district || "N/A"}<br/>
         <strong>Total Rent Owed:</strong> $${rentFormatted}<br/>
@@ -864,6 +1063,54 @@ html_template = """
   // Map load + layers
   // ==========================
   map.on("load", () => {
+    const nbhdInfoContent = document.getElementById("nbhd-info-content");
+
+    function setNbhdInfo(html) {
+      if (nbhdInfoContent) {
+        nbhdInfoContent.innerHTML = html;
+      }
+    }
+
+        function bindNeighborhoodHover(layerId) {
+      if (!map.getLayer(layerId)) return;
+      if (!nbhdChoro || !nbhdChoro.features) return;
+
+      map.on("mousemove", layerId, (e) => {
+        if (!e.features || !e.features.length) return;
+        const f = e.features[0];
+        const p = f.properties || {};
+
+        const name = p.name || "Unknown neighborhood";
+        const total = Number(p.evictions_total);
+        const inc   = Number(p.median_income);
+        const rb    = Number(p.rent_burden_pct);
+
+        const totalStr = Number.isFinite(total)
+          ? total.toLocaleString("en-US")
+          : "N/A";
+        const incStr = Number.isFinite(inc)
+          ? "$" + inc.toLocaleString("en-US", { maximumFractionDigits: 0 })
+          : "N/A";
+        const rbStr = Number.isFinite(rb)
+          ? rb.toFixed(1) + "%"
+          : "N/A";
+
+        setNbhdInfo(
+          `<b>${name}</b><br/>` +
+          `Total evictions (all years): ${totalStr}<br/>` +
+          `Median income: ${incStr}<br/>` +
+          `Severe rent burden (≥50%): ${rbStr}`
+        );
+      });
+
+      map.on("mouseleave", layerId, () => {
+        setNbhdInfo(
+          "Hover over a shaded neighborhood to view total evictions, median income, and severe rent burden."
+        );
+      });
+    }
+
+
     // 3D BUILDINGS LAYER
     const layers = map.getStyle().layers;
     const labelLayer = layers.find(
@@ -901,6 +1148,41 @@ html_template = """
       labelLayerId
     );
 
+        // NEIGHBORHOOD OUTLINE OVERLAY (start hidden)
+    if (neighborhoods && neighborhoods.type === "FeatureCollection") {
+      map.addSource("neighborhoods", {
+        type: "geojson",
+        data: neighborhoods
+      });
+
+      map.addLayer({
+        id: "neighborhood-fill",
+        type: "fill",
+        source: "neighborhoods",
+        paint: {
+          "fill-color": "#3182bd",
+          "fill-opacity": 0.12
+        },
+        layout: {
+          "visibility": "none"
+        }
+      });
+
+      map.addLayer({
+        id: "neighborhood-outline",
+        type: "line",
+        source: "neighborhoods",
+        paint: {
+          "line-color": "#08519c",
+          "line-width": 2.5
+        },
+        layout: {
+          "visibility": "none"
+        }
+      });
+    }
+
+
     // EVICTIONS: CLUSTERED SOURCE
     map.addSource("evictions", {
       type: "geojson",
@@ -920,10 +1202,11 @@ html_template = """
         "circle-color": [
           "step",
           ["get", "point_count"],
-          "#fee5d9", 10,
-          "#fcae91", 50,
-          "#fb6a4a", 100,
-          "#cb181d"
+          "#deebf7",  10,   // very light blue - few points
+      "#9ecae1",  50,   // light blue
+      "#6baed6",  100,  // medium blue
+      "#3182bd",  200,  // darker blue
+      "#08519c"   
         ],
         "circle-radius": [
           "step",
@@ -950,23 +1233,47 @@ html_template = """
         "text-size": 12
       },
       paint: {
-        "text-color": "#202020"
-      }
+    "text-color": "#ffffff",          // white text
+    "text-halo-color": "#08306b",     // dark blue halo for contrast
+    "text-halo-width": 1.5,           // thicker halo
+    "text-halo-blur": 0.5
+  }
     });
 
     // Unclustered individual eviction points
-    map.addLayer({
-      id: "unclustered-point",
-      type: "circle",
-      source: "evictions",
-      filter: ["!", ["has", "point_count"]],
-      paint: {
-        "circle-color": "#800026",
-        "circle-radius": 8,
-        "circle-stroke-width": 0.8,
-        "circle-stroke-color": "#ffffff"
-      }
-    });
+    // Unclustered individual eviction points (yellow → red by Eviction_Count)
+map.addLayer({
+  id: "unclustered-point",
+  type: "circle",
+  source: "evictions",
+  filter: ["!", ["has", "point_count"]],
+  paint: {
+    "circle-color": [
+      "interpolate",
+      ["linear"],
+      ["get", "eviction_count"],
+  1,  "#deebf7",  
+  3,  "#2171b5",  
+  5,  "#6baed6",  
+  10, "#fc9272",  
+  20, "#b10026"   
+],
+    "circle-radius": [
+      "interpolate",
+      ["linear"],
+      ["get", "eviction_count"],
+      1,  6,
+      2,  7,
+      3,  8,
+      5,  9,
+      10, 11,
+      20, 13
+    ],
+    "circle-stroke-width": 0.8,
+    "circle-stroke-color": "#08306b"
+  }
+});
+
 
     // Cluster click: zoom in
     map.on("click", "clusters", (e) => {
@@ -1001,7 +1308,7 @@ html_template = """
         <div style="font-size:12px;line-height:1.4">
           <strong>Address:</strong> ${props.full_address}<br/>
           <strong>Date Filed:</strong> ${props.date_filed}<br/>
-          <strong>Eviction Count:</strong> ${props.eviction_count}<br/>
+          <strong>Number of Tenants Evicted:</strong> ${props.eviction_count}<br/>
           <strong>Cause:</strong> ${props.cause || "N/A"}<br/>
           <strong>Council District:</strong> ${props.council_district || "N/A"}<br/>
           <strong>Total Rent Owed:</strong> $${rentFormatted}<br/>
@@ -1062,6 +1369,72 @@ html_template = """
         map.setPaintProperty(id, "line-width", 2);
       }
     });
+
+    // ==========================
+    // Neighborhood choropleth overlays
+    // ==========================
+    if (nbhdChoro && nbhdChoro.type === "FeatureCollection" && nbhdChoro.features && nbhdChoro.features.length) {
+      map.addSource("nbhd-choropleth-src", {
+        type: "geojson",
+        data: nbhdChoro
+      });
+    }
+
+    function updateChoropleth(propertyName) {
+      const src = map.getSource("nbhd-choropleth-src");
+      if (!src) return;
+
+      // Remove previous layer if present
+      if (map.getLayer("nbhd-choropleth-layer")) {
+        map.removeLayer("nbhd-choropleth-layer");
+      }
+
+      if (!propertyName || propertyName === "none") return;
+
+      const features = (nbhdChoro && nbhdChoro.features) ? nbhdChoro.features : [];
+      const values = features
+        .map(f => Number(f.properties[propertyName]))
+        .filter(v => !isNaN(v) && isFinite(v));
+
+      if (!values.length) return;
+
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      if (!isFinite(min) || !isFinite(max) || min === max) return;
+
+      const mid = (min + max) / 2;
+
+      map.addLayer(
+        {
+          id: "nbhd-choropleth-layer",
+          type: "fill",
+          source: "nbhd-choropleth-src",
+          paint: {
+            "fill-color": [
+              "interpolate",
+              ["linear"],
+              ["get", propertyName],
+              min, "#eff3ff",   // very light blue
+              mid, "#6baed6",   // medium blue
+              max, "#08306b"  
+            ],
+            "fill-opacity": 0.55,
+            "fill-outline-color": "#555555"
+          }
+        },
+        "clusters"  // draw beneath eviction points
+      );
+
+      // Enable hover info for this layer
+      bindNeighborhoodHover("nbhd-choropleth-layer");
+    }
+
+    const choroSelect = document.getElementById("choropleth-select");
+    if (choroSelect) {
+      choroSelect.addEventListener("change", (e) => {
+        updateChoropleth(e.target.value);
+      });
+    }
   });
 </script>
 </body>
@@ -1073,6 +1446,8 @@ html_final = (
     html_template
     .replace("EVIC_DATA_PLACEHOLDER", evictions_json)
     .replace("MAPBOX_TOKEN_PLACEHOLDER", MAPBOX_TOKEN)
+    .replace("NBHD_CHORO_PLACEHOLDER", nbhd_choro_json)
+    .replace("NBHD_DATA_PLACEHOLDER", nbhd_geojson)
 )
 
 # ==============================
@@ -1091,7 +1466,7 @@ total_addresses = ev_filtered["full_address"].nunique()
 total_rent = float(ev_filtered["Total_Rent_Owed"].sum())
 
 with sum_cols[0]:
-    st.metric("Total Evicted Units (filtered)", f"{total_units:,}")
+    st.metric("Total Evicted Tenants (filtered)", f"{total_units:,}")
 with sum_cols[1]:
     st.metric("Unique Address–Date Nodes", f"{len(ev_filtered):,}")
 with sum_cols[2]:
@@ -1128,6 +1503,40 @@ st.write(f"**Area filter:** {selected_area}")
 st.markdown("---")
 
 # ==============================
+# CALLBACKS FOR INTERACTIVE CHART FILTERING
+# ==============================
+def _update_trend_filter():
+    event = st.session_state.get("trend_chart")
+    # No selection -> clear filter
+    if not event or "selection" not in event or not event["selection"].get("points"):
+        st.session_state["trend_filter"] = None
+        return
+
+    x_val = event["selection"]["points"][0]["x"]
+
+    month_ts = pd.to_datetime(x_val)
+    month_ts = month_ts.replace(day=1)
+
+    next_month_ts = month_ts + pd.offsets.MonthBegin(1)
+
+    st.session_state["trend_filter"] = (month_ts, next_month_ts)
+
+def _update_rent_filter():
+    event = st.session_state.get("rent_hist_chart")
+    if not event or "selection" not in event or not event["selection"].get("points"):
+        st.session_state["rent_filter"] = None
+        return
+
+    xs = [p["x"] for p in event["selection"]["points"]]
+    if not xs:
+        st.session_state["rent_filter"] = None
+        return
+
+    r_min = float(min(xs))
+    r_max = float(max(xs))
+    st.session_state["rent_filter"] = (r_min, r_max)
+
+# ==============================
 # ANALYTICS TABS 
 # ==============================
 tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
@@ -1142,7 +1551,8 @@ tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
 
 # --- Eviction Trend (monthly) ---
 with tab_trend:
-    st.subheader("Monthly Evictions (filtered set)")
+    st.subheader("Monthly Evictions")
+    st.caption("Use mouse to click on a data point to view evictions of that month on the map. Click 'clear chart based filters' on the left to reset data.")
     df_trend = ev_filtered.copy()
     df_trend["month"] = df_trend["Date_Filed"].dt.to_period("M").dt.to_timestamp()
     trend = (
@@ -1165,6 +1575,7 @@ with tab_trend:
         
         fig.update_traces(
             mode="lines+markers+text",
+            marker=dict(size=15),
             text=trend["evictions"],
             textposition="top center",
         )
@@ -1174,7 +1585,15 @@ with tab_trend:
             yaxis_title="Number of Evictions",
             yaxis_tickformat=",.0f",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key="trend_chart",
+            on_select=_update_trend_filter,
+            selection_mode="points",
+        )
+        if st.session_state.get("trend_filter") is not None:
+            st.caption("Eviction trend filter is active (use 'Clear Chart-Based Filters' in the sidebar to reset).")
 
 # --- CPI & Rent Index (FRED) ---
 with tab_cpi:
@@ -1214,6 +1633,7 @@ with tab_cpi:
 # --- Rent Owed Histogram (95% cutoff) ---
 with tab_hist:
     st.subheader("Distribution of Rent Owed (excluding top 5% outliers)")
+    st.caption("Use Box Select in top right of the graph to filter for selected units")
     df_hist = ev_filtered.copy()
     df_hist = df_hist[df_hist["Total_Rent_Owed"] > 0]
 
@@ -1240,7 +1660,15 @@ with tab_hist:
             xaxis_tickformat="$,.0f",
             yaxis_title="Number of Separate Eviction Addresses",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key="rent_hist_chart",
+            on_select=_update_rent_filter,
+            selection_mode="box",
+        )
+        if st.session_state.get("rent_filter") is not None:
+            st.caption("Rent owed histogram filter is active (use 'Clear Chart-Based Filters' in the sidebar to reset).")
 
 # --- Eviction Causes Pie ---
 with tab_causes:
@@ -1279,7 +1707,7 @@ with tab_causes:
             hole=0.3,
         )
         fig.update_traces(textposition="inside", textinfo="label+percent")
-        fig.update_layout(height=360, margin=dict(l=20, r=20, t=50, b=40))
+        fig.update_layout(height=420, margin=dict(l=20, r=20, t=50, b=40))
         st.plotly_chart(fig, use_container_width=True)
 
 # --- Demographics (Census) ---
@@ -1370,4 +1798,3 @@ with tab_demo:
             st.plotly_chart(fig_demo, use_container_width=True)
         else:
             st.info("No racial composition columns found in census file.")
-
