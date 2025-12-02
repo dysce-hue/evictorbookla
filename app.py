@@ -300,7 +300,7 @@ st.markdown(
     .creator-badge {
         position: fixed;
         left: 12px;
-        bottom: -20px;
+        bottom: 12px;
         z-index: 9999;
         padding: 4px 10px;
         border-radius: 999px;
@@ -490,7 +490,7 @@ st.sidebar.markdown(
     .sidebar-creator-badge {
         position: absolute;
         left: 10px;
-        bottom: 10px;
+        bottom: -20px;
         padding: 4px 10px;
         border-radius: 999px;
         font-size: 11px;
