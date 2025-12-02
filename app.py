@@ -446,7 +446,7 @@ st.sidebar.markdown(
     .sidebar-creator-badge {
         position: absolute;
         left: 10px;
-        bottom: 10px;
+        bottom: 1px;
         padding: 4px 10px;
         border-radius: 10px;
         font-size: 11px;
