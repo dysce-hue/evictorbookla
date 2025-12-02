@@ -1,0 +1,334 @@
+import os
+import json
+import zipfile
+import requests
+import pandas as pd
+import geopandas as gpd
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+CENSUS_API_KEY = "51f6b0e79ad9a10528f1d5c038bd385ccc06c641"  # <--- your key
+YEAR = 2022              # ACS 5-year
+STATE_FIPS = "06"        # California
+COUNTY_FIPS = "037"      # Los Angeles County
+
+DATA_DIR = "data"
+NBHD_SHP = os.path.join(
+    DATA_DIR,
+    "8494cd42-db48-4af1-a215-a2c8f61e96a22020328-1-621do0.x5yiu.shp"
+)
+TRACT_SHP = os.path.join(DATA_DIR, "tl_2022_06_tract.shp")
+
+TRACT_ZIP_URL = (
+    "https://www2.census.gov/geo/tiger/TIGER2022/TRACT/tl_2022_06_tract.zip"
+)
+
+OUT_CSV = os.path.join(DATA_DIR, "neighborhood_census.csv")
+
+# ACS variable list:
+# - Median income
+# - Median rent
+# - Total population
+# - Renter households
+# - Severe rent burden (≥ 50% of income on rent) - here we only use one category
+# - Race / ethnicity
+ACS_VARS = {
+    "median_income": "B19013_001E",
+    "median_rent": "B25064_001E",
+    "pop_total": "B01003_001E",
+    "renters_total": "B25070_001E",
+    # B25070_010E is "50.0 percent or more" category in many ACS vintages
+    "rb_50_1": "B25070_010E",
+    "race_total": "B03002_001E",
+    "White": "B03002_003E",
+    "Black": "B03002_004E",
+    "Hispanic": "B03002_012E",
+    "Asian": "B03002_006E",
+}
+
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def ensure_tract_shapefile():
+    """
+    Make sure tl_2022_06_tract.shp exists in DATA_DIR.
+    If not, download the TIGER/Line zip and extract it.
+    """
+    if os.path.exists(TRACT_SHP):
+        print("Tract shapefile already exists:", TRACT_SHP)
+        return
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    zip_path = os.path.join(DATA_DIR, "tl_2022_06_tract.zip")
+
+    print("Tract shapefile not found. Downloading from Census TIGER/Line...")
+    print(f"Downloading to: {zip_path}")
+
+    resp = requests.get(TRACT_ZIP_URL, stream=True)
+    resp.raise_for_status()
+
+    with open(zip_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+    print("Extracting tract shapefile...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(DATA_DIR)
+
+    print("Finished downloading and extracting tract shapefile.")
+
+
+# -----------------------------
+# 1. FETCH ACS TRACT DATA
+# -----------------------------
+def fetch_acs_tract_data() -> pd.DataFrame:
+    """
+    Pull ACS 5-year data at tract level for LA County.
+    Returns a DataFrame with GEOID + cleaned numeric columns.
+    """
+    base_url = f"https://api.census.gov/data/{YEAR}/acs/acs5"
+    var_list = ",".join(ACS_VARS.values())
+    get_params = f"NAME,{var_list}"
+
+    params = {
+        "get": get_params,
+        "for": "tract:*",
+        "in": f"state:{STATE_FIPS} county:{COUNTY_FIPS}",
+        "key": CENSUS_API_KEY,
+    }
+
+    print("Requesting ACS data from Census API...")
+    resp = requests.get(base_url, params=params)
+    print("Status code:", resp.status_code)
+    print("Final URL:", resp.url)
+    resp.raise_for_status()
+
+    data = resp.json()
+    header = data[0]
+    rows = data[1:]
+    df = pd.DataFrame(rows, columns=header)
+
+    # Build full tract GEOID for merging: state + county + tract
+    df["GEOID"] = df["state"] + df["county"] + df["tract"]
+
+    # Rename ACS variable codes to nicer names
+    rename_map = {v: k for k, v in ACS_VARS.items()}
+    df = df.rename(columns=rename_map)
+
+    # Convert ACS numeric columns to numbers
+    for col in rename_map.values():
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 🔴 IMPORTANT: ACS uses negative codes for missing/suppressed values
+    # Make all negative values NA so they don't contaminate weighted averages
+    clean_cols = [
+        "median_income",
+        "median_rent",
+        "pop_total",
+        "renters_total",
+        "rb_50_1",
+        "race_total",
+        "White",
+        "Black",
+        "Hispanic",
+        "Asian",
+    ]
+    for col in clean_cols:
+        if col in df.columns:
+            df.loc[df[col] < 0, col] = pd.NA
+
+    # Severe rent burden: percentage of renter households with ≥50% of income on rent
+    rb_cols = [c for c in ["rb_50_1"] if c in df.columns]
+    df["rent_burden_50_plus"] = df[rb_cols].sum(axis=1)
+
+    df["rent_burden_pct"] = (
+        df["rent_burden_50_plus"]
+        / df["renters_total"].replace({0: pd.NA})
+    ) * 100
+
+    # Race shares (% of total race universe)
+    for race in ["White", "Black", "Hispanic", "Asian"]:
+        if race in df.columns:
+            df[f"{race}_share"] = (
+                df[race] / df["race_total"].replace({0: pd.NA})
+            ) * 100
+        else:
+            df[f"{race}_share"] = pd.NA
+
+    return df
+
+
+# -----------------------------
+# 2. LOAD GEOMETRIES
+# -----------------------------
+def load_geometries():
+    """
+    Load neighborhood and tract geometries as GeoDataFrames.
+    Both are returned in EPSG:4326 for overlay.
+    """
+    # Ensure tract shapefile is present
+    ensure_tract_shapefile()
+
+    print("Loading neighborhood shapefile...")
+    nbhd = gpd.read_file(NBHD_SHP)
+    if nbhd.crs is None:
+        # LA Times shapefile is often in EPSG:3310
+        nbhd = nbhd.set_crs(epsg=3310)
+    nbhd = nbhd.to_crs(epsg=4326)
+
+    if "name" not in nbhd.columns:
+        raise ValueError("Neighborhood shapefile must have a 'name' column.")
+
+    nbhd["name"] = nbhd["name"].astype(str)
+    nbhd = nbhd[nbhd.geometry.notna()]
+
+    print("Loading tract shapefile...")
+    tracts = gpd.read_file(TRACT_SHP)
+    if tracts.crs is None:
+        # TIGER is usually NAD83
+        tracts = tracts.set_crs(epsg=4269)
+    tracts = tracts.to_crs(epsg=4326)
+
+    # Ensure GEOID for merging with ACS
+    if "GEOID" not in tracts.columns:
+        if "GEOID10" in tracts.columns:
+            tracts = tracts.rename(columns={"GEOID10": "GEOID"})
+        else:
+            raise ValueError("Tract shapefile must have GEOID or GEOID10 column.")
+
+    tracts = tracts[tracts.geometry.notna()]
+
+    return nbhd, tracts
+
+
+# -----------------------------
+# 3. AGGREGATE TO NEIGHBORHOODS
+# -----------------------------
+def aggregate_to_neighborhoods(
+    acs_df: pd.DataFrame,
+    nbhd: gpd.GeoDataFrame,
+    tracts: gpd.GeoDataFrame,
+) -> pd.DataFrame:
+    """
+    Spatially intersect tracts with neighborhoods and
+    compute population-weighted neighborhood-level metrics.
+
+    Output columns:
+      name, median_income, median_rent, rent_burden_pct,
+      White_share, Black_share, Hispanic_share, Asian_share, Other_share
+    """
+    print("Merging ACS data with tracts...")
+    tracts_acs = tracts.merge(acs_df, on="GEOID", how="left")
+
+    print("Computing spatial intersection (this may take a while)...")
+    # overlay expects both in same CRS (they are: EPSG:4326)
+    inter = gpd.overlay(tracts_acs, nbhd, how="intersection")
+
+    # Drop pieces with empty geometry
+    inter = inter[inter.geometry.notna()]
+
+    # IMPORTANT: reproject to a projected CRS for area calculations
+    inter = inter.to_crs(epsg=3310)
+
+    # Area of the intersected piece
+    inter["inter_area"] = inter.geometry.area
+
+    # Total area per tract (sum of intersected bits)
+    inter["tract_area"] = inter.groupby("GEOID")["inter_area"].transform("sum")
+    inter["area_weight"] = inter["inter_area"] / inter["tract_area"].replace(
+        {0: pd.NA}
+    )
+
+    # Population-based weighting where available
+    if "pop_total" in inter.columns:
+        inter["pop_weight_raw"] = inter["pop_total"].fillna(0) * inter[
+            "area_weight"
+        ].fillna(0)
+    else:
+        inter["pop_weight_raw"] = inter["area_weight"].fillna(0)
+
+    # Normalize population weights within each neighborhood
+    group_sum = inter.groupby("name")["pop_weight_raw"].transform("sum")
+    inter["pop_weight"] = inter["pop_weight_raw"] / group_sum.replace(
+        {0: pd.NA}
+    )
+    inter["pop_weight"] = inter["pop_weight"].fillna(0)
+
+    # Variables to aggregate
+    scalar_vars = [
+        "median_income",
+        "median_rent",
+        "rent_burden_pct",
+        "White_share",
+        "Black_share",
+        "Hispanic_share",
+        "Asian_share",
+    ]
+
+    records = []
+    for name, group in inter.groupby("name"):
+        row = {"name": name}
+        w = group["pop_weight"].fillna(0)
+
+        for var in scalar_vars:
+            if var in group.columns:
+                vals = group[var]
+                row[var] = float((vals * w).sum())
+            else:
+                row[var] = None
+
+        # "Other" = 100 - (White + Black + Hispanic + Asian) if those exist
+        if all(
+            pd.notnull(row.get(c))
+            for c in ["White_share", "Black_share", "Hispanic_share", "Asian_share"]
+        ):
+            row["Other_share"] = max(
+                0.0,
+                100.0
+                - (
+                    row["White_share"]
+                    + row["Black_share"]
+                    + row["Hispanic_share"]
+                    + row["Asian_share"]
+                ),
+            )
+        else:
+            row["Other_share"] = None
+
+        records.append(row)
+
+    out_df = pd.DataFrame(records)
+    # Optional: sort alphabetically for nicer CSV
+    out_df = out_df.sort_values("name").reset_index(drop=True)
+    return out_df
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+    # 1. Fetch ACS tract-level data
+    acs_df = fetch_acs_tract_data()
+
+    # 2. Load neighborhoods & tract geometries
+    nbhd, tracts = load_geometries()
+
+    # 3. Intersect and aggregate to neighborhood level
+    nbhd_stats = aggregate_to_neighborhoods(acs_df, nbhd, tracts)
+
+    # 4. Save to CSV for your Streamlit app
+    os.makedirs(DATA_DIR, exist_ok=True)
+    nbhd_stats.to_csv(OUT_CSV, index=False)
+    print(f"Saved neighborhood census data to: {OUT_CSV}")
+
+
+if __name__ == "__main__":
+    main()
+
+import pandas as pd
+df = pd.read_csv("data/neighborhood_census.csv")
+
+df["median_income"].describe()
