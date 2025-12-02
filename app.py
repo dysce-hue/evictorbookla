@@ -300,7 +300,7 @@ st.markdown(
     .creator-badge {
         position: fixed;
         left: 12px;
-        bottom: 12px;
+        bottom: 5px;
         z-index: 9999;
         padding: 4px 10px;
         border-radius: 999px;
