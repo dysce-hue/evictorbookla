@@ -297,6 +297,31 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    .creator-badge {
+        position: fixed;
+        left: 12px;
+        bottom: 12px;
+        z-index: 9999;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 500;
+        background: rgba(255, 255, 255, 0.9);  /* tweak if you want darker */
+        color: #0f172a;                         /* text color */
+        box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+    }
+    </style>
+
+    <div class="creator-badge">
+        Created by <b>Dylan Guthrie</b>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <style>
     /* Make the sidebar header (EvictorBookLA) larger and bolder */
     section[data-testid="stSidebar"] h2 {
         font-size: 2.0rem !important;   /* tweak this value */
@@ -393,7 +418,7 @@ st.caption(
     
     "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array. "
     "The following map is still a work in progress. Future Content: a methodology tab, more inferential statistics, upgraded UI, more up-to-date eviction data, and further information on corporate ownership of units."
-    "Note: there is still a large margin of error in some statistics, which should not be taken wholeheartedly prior to the creation of the methodology tab. AI was used in assistance of coding"
+    "Note: there is still a large margin of error in some statistics, which should not be taken wholeheartedly prior to the creation of the methodology tab. AI was used for assistance in coding."
     
 )
 
