@@ -431,7 +431,7 @@ if evictions.empty:
 st.sidebar.image(
     "la_logo.png",
     width=30,         
-    use_column_width=false
+    use_column_width=False
 )
 st.sidebar.header("EvictorBookLA")
 
