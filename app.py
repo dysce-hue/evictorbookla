@@ -299,8 +299,8 @@ st.markdown(
     <style>
     .creator-badge {
         position: fixed;
-        left: 12px;
-        bottom: 12px;
+        left: 10px;
+        bottom: -12px;
         z-index: 9999;
         padding: 4px 10px;
         border-radius: 999px;
