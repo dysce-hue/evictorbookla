@@ -404,7 +404,7 @@ if evictions.empty:
 # SIDEBAR FILTERS
 # ==============================
 st.sidebar.image(
-    "Lalogo.png",
+    "la_logo.png",
     width=120,         
     use_column_width=False
 )
