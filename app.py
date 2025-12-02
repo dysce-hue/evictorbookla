@@ -389,9 +389,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.caption(
-    "Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed "
+    "Data collected from the Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed. "
+    
     "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array. "
-    "The following map is still a work in progress. Future Content: Methodology Tab, Neighborhood Data Overlays, Inferential Statistics, Upgraded UI, more up-to-date eviction data, and further information on corporate parcel ownership of units." 
+    "The following map is still a work in progress. Future Content: a methodology tab, more inferential statistics, upgraded UI, more up-to-date eviction data, and further information on corporate ownership of units."
+    "Note: there is still a large margin of error in some statistics, which should not be taken wholeheartedly prior to the creation of the methodology tab. AI was used in assistance of coding"
+    
 )
 
 if evictions.empty:
@@ -401,7 +404,7 @@ if evictions.empty:
 # SIDEBAR FILTERS
 # ==============================
 st.sidebar.image(
-    "la_logo.png",
+    "Lalogo.png",
     width=120,         
     use_column_width=False
 )
