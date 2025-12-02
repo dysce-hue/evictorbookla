@@ -430,10 +430,42 @@ if evictions.empty:
 # ==============================
 st.sidebar.image(
     "la_logo.png",
-    width=120,         
+    width=100,         
     use_column_width=False
 )
 st.sidebar.header("EvictorBookLA")
+
+st.sidebar.markdown(
+    """
+    <style>
+    /* Make sidebar container a positioning context */
+    [data-testid="stSidebar"] > div:first-child {
+        position: relative;
+    }
+
+    .sidebar-creator-badge {
+        position: absolute;
+        left: 10px;
+        bottom: 10px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 500;
+        background: rgba(255, 255, 255, 0.9);
+        color: #0f172a;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.12);
+        z-index: 999;
+        white-space: nowrap;
+    }
+    </style>
+
+    <div class="sidebar-creator-badge">
+        Created by <b>Dylan Guthrie</b>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 min_date = evictions["Date_Filed"].min()
 max_date = evictions["Date_Filed"].max()
