@@ -2,13 +2,14 @@ import os
 import json
 import base64
 import copy
+import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
+from ui_helpers import embed_html, readable_timeline, readable_neighborhoods
 import plotly.express as px
 import plotly.graph_objects as go
 from fred_data import fetch_rent_cpi, RENT_SERIES
@@ -53,7 +54,7 @@ NBHD_SHP = os.path.join(DATA_DIR, "8494cd42-db48-4af1-a215-a2c8f61e96a22020328-1
 # Optional pre-aggregated census file
 NEIGHBORHOOD_CENSUS_CSV = os.path.join(DATA_DIR, "neighborhood_census.csv")
 
-# FRED CPI config 
+# FRED CPI config
 FRED_API_KEY = get_config_value("FRED_API_KEY")
 FRED_SERIES_ID = RENT_SERIES  # US city average rent of primary residence
 
@@ -112,7 +113,7 @@ def cause_category(value):
 # ==============================
 # DATA LOADING — EVICTIONS
 # ==============================
-@st.cache_data
+@st.cache_data(persist="disk", max_entries=3, show_spinner="Preparing mapped notice data…")
 def load_evictions(path, modified_at=None):
     if not os.path.exists(path):
         st.error(f"Eviction CSV not found at: {path}")
@@ -235,7 +236,7 @@ def load_evictions(path, modified_at=None):
     return agg
 
 
-@st.cache_data(show_spinner="Loading Zillow ZIP rent data…")
+@st.cache_data(persist="disk", max_entries=3, show_spinner="Loading Zillow ZIP rent data…")
 def load_zori_zip(path, modified_at):
     """Load the supplied Zillow ZORI series at ZIP-by-month grain."""
     del modified_at
@@ -262,7 +263,7 @@ def load_zori_zip(path, modified_at):
     return zori, month_columns
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(persist="disk", max_entries=3, show_spinner=False)
 def load_zip_boundaries(path, modified_at):
     """Load generalized Census ZCTA polygons used for the ZIP rent overlay."""
     del modified_at
@@ -278,8 +279,8 @@ def load_zip_boundaries(path, modified_at):
     return payload
 
 
-@st.cache_data
-def load_rent_records(path):
+@st.cache_data(persist="disk", max_entries=3)
+def load_rent_records(path, modified_at=None):
     """Load notice-level rent amounts for a no-bucket distribution view."""
     needed = {"full_address", "Date Received", "Rent Owed", "Zip"}
     records = pd.read_csv(
@@ -408,6 +409,8 @@ def filter_by_area(ev_df, area_choice, subdiv, nbhd, subdiv_minus):
     # Subdivision (excl neighborhoods) match
     prefix = "Subdiv (excl. neighborhoods): "
     if area_choice.startswith(prefix):
+        # Polygon subtraction is unnecessary for the default map.
+        subdiv_minus = compute_subdiv_minus_neighborhood()
         subdiv_name = area_choice.replace(prefix, "")
         poly = subdiv_minus[subdiv_minus["Subdiv_Name"] == subdiv_name]
         if poly.empty:
@@ -454,6 +457,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+st.title("EVICTOR BOOK ALPHA")
+st.caption("Los Angeles reported eviction notices · 3D map, rent comparisons, address profiles and research tools")
 
 st.markdown(
     """
@@ -521,13 +526,22 @@ def _auto_refresh_if_due():
     if refreshed_at is None or (now - refreshed_at).total_seconds() >= interval_hours * 3600:
         with st.spinner("Checking LAHD for updated eviction notices…"):
             result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=False, geocode=False)
-            st.cache_data.clear()
+            if result.get("status") == "updated":
+                st.cache_data.clear()
             return result
     return None
 
 
 @st.fragment(run_every="1h")
 def refresh_status():
+    # Never put a potentially 180-second source download on the first render.
+    now = time.monotonic()
+    if "_lahd_next_check" not in st.session_state:
+        st.session_state["_lahd_next_check"] = now + 3600
+    if now < st.session_state["_lahd_next_check"]:
+        st.caption("Using the saved LAHD dataset. Automatic update checks begin after one hour; manual refresh is available in Data admin.")
+        return
+    st.session_state["_lahd_next_check"] = now + 3600
     try:
         if _auto_refresh_if_due() is not None:
             st.rerun()
@@ -558,8 +572,15 @@ else:
     zip_boundaries = {"type": "FeatureCollection", "features": []}
 subdiv = load_subdivisions()
 nbhd = load_neighborhoods()
-subdiv_minus = compute_subdiv_minus_neighborhood()
-cpi_df, cpi_source, cpi_notes = load_cpi(FRED_API_KEY)
+# Calculate exclusion geometry only when that area filter is selected.
+subdiv_minus = subdiv
+if st.sidebar.checkbox("Load optional FRED rent index", value=False,
+                       help="External data download; leave off for faster startup."):
+    cpi_df, cpi_source, cpi_notes = load_cpi(FRED_API_KEY)
+else:
+    cpi_df = pd.DataFrame(columns=["date", "value"])
+    cpi_source = "Not requested"
+    cpi_notes = ["Enable ‘Load optional FRED rent index’ in the sidebar to load the national CPI comparison."]
 census_df = load_neighborhood_census()
 
 # ==============================
@@ -633,17 +654,13 @@ def clear_chart_filters():
     st.session_state["trend_filter"] = None
     st.session_state["rent_filter"] = None
 
-st.markdown(
-    "<h1 style='font-size: 2.5rem; font-weight: 700;'>EVICTOR BOOK ALPHA</h1>",
-    unsafe_allow_html=True,
-)
 st.caption(
     "Data collected from the Los Angeles Housing Department Eviction notices filed from the City of Los Angeles. Retrieved from https://housing.lacity.gov/residents/renters/eviction-notices-filed. "
-    
+
     "Scroll, pan, and zoom. Click points to select data nodes and draw polygons to select multiple data nodes and place them in an array. "
     "The following map is still a work in progress. Future Content: a methodology tab, more inferential statistics, upgraded UI, more up-to-date eviction data, and further information on corporate ownership of units."
     "Note: there is still a large margin of error in some statistics, which should not be taken wholeheartedly prior to the creation of the methodology tab. AI was used for assistance in coding."
-    
+
 )
 
 if evictions.empty:
@@ -1242,6 +1259,10 @@ html_template = """
 </div>
 
 <script>
+  window.addEventListener("error", () => {
+    const status = document.getElementById("map-status");
+    if (status) status.textContent = "Map initialization failed. Check blocked scripts, Mapbox configuration, or browser WebGL support. Notice analytics remain available below.";
+  });
   mapboxgl.accessToken = "MAPBOX_TOKEN_PLACEHOLDER";
 
   // Compact eviction rows from Streamlit. Keeping these as arrays avoids
@@ -1320,6 +1341,20 @@ evictionRows.length = 0;
     bearing: -17.6,
     antialias: true
   });
+  map.on("error", (event) => {
+    const status = document.getElementById("map-status");
+    if (status) {
+      status.style.display = "block";
+      status.textContent = "Map could not load. Check the Mapbox public token, its allowed URLs, and network access. Notice charts remain available below.";
+    }
+    console.error("Mapbox map error", event.error && event.error.message);
+  });
+  setTimeout(() => {
+    if (!map.isStyleLoaded()) {
+      const status = document.getElementById("map-status");
+      if (status) status.textContent = "Map is taking longer than expected. Check Mapbox token configuration or blocked map requests; analytics are available below.";
+    }
+  }, 20000);
 
   // ==========================
   // Mapbox Draw control
@@ -1752,7 +1787,7 @@ evictionRows.length = 0;
       "#9ecae1",  50,   // light blue
       "#6baed6",  100,  // medium blue
       "#3182bd",  200,  // darker blue
-      "#08519c"   
+      "#08519c"
         ],
         "circle-radius": [
           "step",
@@ -1798,11 +1833,11 @@ map.addLayer({
       "interpolate",
       ["linear"],
       ["get", "eviction_count"],
-  1,  "#deebf7",  
-  3,  "#2171b5",  
-  5,  "#6baed6",  
-  10, "#fc9272",  
-  20, "#b10026"   
+  1,  "#deebf7",
+  3,  "#2171b5",
+  5,  "#6baed6",
+  10, "#fc9272",
+  20, "#b10026"
 ],
     "circle-radius": [
       "interpolate",
@@ -2155,7 +2190,7 @@ map.addLayer({
     if (mapStatus) mapStatus.textContent = "Rendering eviction clusters…";
     const finishMapLoad = () => {
       const sourceFeatures = map.querySourceFeatures("evictions");
-      if (sourceFeatures.length > 0) {
+      if (sourceFeatures.length > 0 || evictionFeatures.length === 0) {
         if (mapStatus) mapStatus.style.display = "none";
         map.off("idle", finishMapLoad);
       }
@@ -2191,7 +2226,10 @@ if selected_zori_month is not None:
         f"The default ZIP overlay shows Zillow ZORI for {zori_month_label}; selected ZIPs have an orange outline. "
         "ZORI estimates typical market asking rent and is not a unit-level contract rent. ZIP areas use Census ZCTAs."
     )
-components.html(html_final, height=720, scrolling=False)
+if not MAPBOX_TOKEN:
+    st.error("The ALPHA map needs a Mapbox public token. In Streamlit Cloud → App settings → Secrets, set MAPBOX_TOKEN to your public token (pk.…). All notice charts and downloads remain available below.")
+else:
+    embed_html(html_final, height=720)
 
 st.markdown("---")
 st.markdown("### Summary & Download")
@@ -2276,7 +2314,7 @@ def _update_rent_filter():
 # Reuse the same notice-level population for the rent comparison and the
 # individualized rent-owed distribution. Address-date matching carries all
 # active map filters down to the original LAHD notice rows.
-rent_records = load_rent_records(EVICTION_CSV)
+rent_records = load_rent_records(EVICTION_CSV, os.path.getmtime(EVICTION_CSV))
 selected_nodes = ev_filtered[["full_address", "Date_Filed"]].drop_duplicates()
 df_rent_records = rent_records.merge(
     selected_nodes,
@@ -2285,7 +2323,7 @@ df_rent_records = rent_records.merge(
 )
 
 # ==============================
-# ANALYTICS TABS 
+# ANALYTICS TABS
 # ==============================
 tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
     [
@@ -2294,610 +2332,616 @@ tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
         " Rent Owed Distribution",
         " Eviction Causes",
         " Demographics (Census Data)",
-    ]
+    ], on_change="rerun", key="alpha_analytics_tabs",
 )
 
 # --- Eviction Trend (monthly) ---
 with tab_trend:
-    st.subheader("Monthly Evictions")
-    st.caption("Counts are LAHD notice records received, not completed evictions or unique tenants. This chart follows map filters and includes only geocoded records. See Methods for all-source monthly coverage.")
-    st.caption("Use mouse to click on a data point to view evictions of that month on the map. Click 'clear chart based filters' on the left to reset data.")
-    df_trend = ev_filtered.copy()
-    df_trend["month"] = df_trend["Date_Filed"].dt.to_period("M").dt.to_timestamp()
-    trend = (
-        df_trend.groupby("month", as_index=False)["Eviction_Count"]
-        .sum()
-        .rename(columns={"Eviction_Count": "evictions"})
-        .sort_values("month")
-    )
-
-    if trend.empty:
-        st.info("No data in this range.")
-    else:
-        fig = px.line(
-            trend,
-            x="month",
-            y="evictions",
-            markers=True,
-            labels={"month": "Month", "evictions": "Number of Evictions"},
-        )
-        
-        fig.update_traces(
-            mode="lines+markers+text",
-            marker=dict(size=15),
-            text=trend["evictions"],
-            textposition="top center",
-        )
-        fig.update_layout(
-            height=430,
-            margin=dict(l=40, r=20, t=60, b=40),
-            yaxis_title="Number of Evictions",
-            yaxis_tickformat=",.0f",
-        )
-        st.plotly_chart(
-            fig,
-            width="stretch",
-            key="trend_chart",
-            on_select=_update_trend_filter,
-            selection_mode="points",
-        )
-        if st.session_state.get("trend_filter") is not None:
-            st.caption("Eviction trend filter is active (use 'Clear Chart-Based Filters' in the sidebar to reset).")
-
-# --- Zillow asking rent vs. LAHD reported rent owed ---
-with tab_cpi:
-    st.subheader("Monthly asking rent and reported rent owed")
-    st.caption(
-        "Zillow ZORI is the unweighted average typical asking rent across ZIP codes represented "
-        "by the current filters. LAHD rent owed is the average positive balance reported on each "
-        "matched notice. A notice balance may cover multiple months, so the two lines are contextually "
-        "related but are not equivalent rent measures."
-    )
-
-    positive_owed_records = df_rent_records[df_rent_records["Rent_Owed"] > 0].copy()
-    eligible_zips = sorted(
-        zip_code for zip_code in ev_filtered["Zip"].dropna().astype(str).unique()
-        if zip_code
-    )
-
-    if ev_filtered.empty:
-        st.info("No eviction records match the current filters.")
-    elif not eligible_zips or zori_zip.empty or not zori_month_columns:
-        st.info("No Zillow ZIP observations match the current filtered eviction records.")
-    else:
-        comparison_start = ev_filtered["Date_Filed"].min().to_period("M").to_timestamp()
-        comparison_end = ev_filtered["Date_Filed"].max().to_period("M").to_timestamp()
-        comparison_months = pd.date_range(comparison_start, comparison_end, freq="MS")
-
-        zori_matrix = zori_zip.reindex(eligible_zips)[zori_month_columns].T
-        zori_matrix.index = pd.to_datetime(zori_matrix.index).to_period("M").to_timestamp()
-        zori_matrix = zori_matrix.loc[
-            (zori_matrix.index >= comparison_start)
-            & (zori_matrix.index <= comparison_end)
-        ]
-        zori_monthly = pd.DataFrame(
-            {
-                "month": zori_matrix.index,
-                "average_zori": zori_matrix.mean(axis=1, skipna=True).values,
-                "zori_zip_count": zori_matrix.count(axis=1).values,
-            }
+    if tab_trend.open:
+        st.subheader("Monthly Evictions")
+        st.caption("Counts are LAHD notice records received, not completed evictions or unique tenants. This chart follows map filters and includes only geocoded records. See Methods for all-source monthly coverage.")
+        st.caption("Use mouse to click on a data point to view evictions of that month on the map. Click 'clear chart based filters' on the left to reset data.")
+        df_trend = ev_filtered.copy()
+        df_trend["month"] = df_trend["Date_Filed"].dt.to_period("M").dt.to_timestamp()
+        trend = (
+            df_trend.groupby("month", as_index=False)["Eviction_Count"]
+            .sum()
+            .rename(columns={"Eviction_Count": "evictions"})
+            .sort_values("month")
         )
 
-        if positive_owed_records.empty:
-            owed_monthly = pd.DataFrame(columns=["month", "average_rent_owed", "notice_count"])
+        if trend.empty:
+            st.info("No data in this range.")
         else:
-            positive_owed_records["month"] = (
-                positive_owed_records["Date_Filed"].dt.to_period("M").dt.to_timestamp()
-            )
-            owed_monthly = (
-                positive_owed_records.groupby("month", as_index=False)
-                .agg(
-                    average_rent_owed=("Rent_Owed", "mean"),
-                    notice_count=("Rent_Owed", "size"),
-                )
+            fig = px.line(
+                trend,
+                x="month",
+                y="evictions",
+                markers=True,
+                labels={"month": "Month", "evictions": "Notice records"},
             )
 
-        rent_comparison = pd.DataFrame({"month": comparison_months})
-        rent_comparison = rent_comparison.merge(zori_monthly, on="month", how="left")
-        rent_comparison = rent_comparison.merge(owed_monthly, on="month", how="left")
-        rent_comparison["zori_zip_count"] = rent_comparison["zori_zip_count"].fillna(0).astype(int)
-        rent_comparison["notice_count"] = rent_comparison["notice_count"].fillna(0).astype(int)
-
-        if rent_comparison[["average_zori", "average_rent_owed"]].notna().sum().sum() == 0:
-            st.info("No Zillow or positive rent-owed observations fall in this filtered period.")
-        else:
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=rent_comparison["month"],
-                    y=rent_comparison["average_zori"],
-                    mode="lines+markers",
-                    name="Average ZIP asking rent (ZORI)",
-                    line={"color": "#2563eb", "width": 3},
-                    marker={"size": 6},
-                    customdata=rent_comparison[["zori_zip_count"]].to_numpy(),
-                    hovertemplate=(
-                        "%{x|%B %Y}<br>Average ZORI: $%{y:,.0f}"
-                        "<br>ZIP observations: %{customdata[0]:,}<extra></extra>"
-                    ),
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=rent_comparison["month"],
-                    y=rent_comparison["average_rent_owed"],
-                    mode="lines+markers",
-                    name="Average reported rent owed per notice",
-                    line={"color": "#ea580c", "width": 3},
-                    marker={"size": 6},
-                    customdata=rent_comparison[["notice_count"]].to_numpy(),
-                    hovertemplate=(
-                        "%{x|%B %Y}<br>Average reported owed: $%{y:,.0f}"
-                        "<br>Positive-balance notices: %{customdata[0]:,}<extra></extra>"
-                    ),
-                )
+            fig.update_traces(
+                mode="lines+markers+text",
+                marker=dict(size=15),
+                text=trend["evictions"],
+                textposition="top center",
             )
             fig.update_layout(
-                height=470,
-                margin=dict(l=40, r=20, t=30, b=40),
-                yaxis_title="USD",
-                yaxis_tickprefix="$",
+                height=430,
+                margin=dict(l=40, r=20, t=60, b=40),
+                yaxis_title="Notice records",
                 yaxis_tickformat=",.0f",
-                hovermode="x unified",
-                legend={"orientation": "h", "y": 1.08, "x": 0},
-            )
-            st.plotly_chart(fig, width="stretch")
-            st.download_button(
-                "Download monthly rent comparison",
-                rent_comparison.to_csv(index=False),
-                "zillow_zori_vs_lahd_rent_owed.csv",
-                "text/csv",
-            )
-
-    with st.expander("CPI rent-index context", expanded=False):
-        st.caption(f"{FRED_SERIES_ID}: US city average rent of primary residence; index 1982–1984=100. Source: {cpi_source}. This is an index, not a dollar rent.")
-        for note in cpi_notes:
-            st.info(note)
-        if cpi_df.empty or ev_filtered.empty:
-            st.info("CPI data could not be loaded for this view.")
-        else:
-            date_min = ev_filtered["Date_Filed"].min()
-            date_max = ev_filtered["Date_Filed"].max()
-            sub_cpi = cpi_df[
-                (cpi_df["date"] >= date_min) & (cpi_df["date"] <= date_max)
-            ]
-            if sub_cpi.empty:
-                st.info("No CPI observations in this date range.")
-            else:
-                fig_cpi = px.line(
-                    sub_cpi,
-                    x="date",
-                    y="value",
-                    markers=True,
-                    labels={"date": "Date", "value": "CPI (Rent Index)"},
-                )
-                fig_cpi.update_layout(
-                    height=360,
-                    margin=dict(l=40, r=20, t=30, b=40),
-                    yaxis_title="CPI (Rent Index)",
-                    yaxis_tickformat=",.1f",
-                )
-                st.plotly_chart(fig_cpi, width="stretch")
-
-# --- Rent Owed Distribution (95% cutoff) ---
-with tab_hist:
-    st.subheader("Distribution of reported rent owed")
-    st.caption(
-        "The individualized histogram uses every LAHD notice with a positive rent-owed "
-        "amount; the top 5% are excluded. LAHD does not provide a verified unit "
-        "identifier, so records should not be interpreted as confirmed unique apartments."
-    )
-
-    df_rent_records = df_rent_records[df_rent_records["Rent_Owed"] > 0].copy()
-
-    if df_rent_records.empty:
-        st.info("No positive rent-owed values to display.")
-    else:
-        cutoff = float(df_rent_records["Rent_Owed"].quantile(0.95))
-        df_rent_trimmed = df_rent_records[
-            df_rent_records["Rent_Owed"] <= cutoff
-        ].copy()
-
-        metrics = st.columns(3)
-        metrics[0].metric("Notice records shown", f"{len(df_rent_trimmed):,}")
-        metrics[1].metric(
-            "Median reported rent owed",
-            f"${df_rent_trimmed['Rent_Owed'].median():,.0f}",
-        )
-        metrics[2].metric("95th-percentile cutoff", f"${cutoff:,.0f}")
-
-        distribution_view = st.radio(
-            "Distribution view",
-            [
-                "Density curve",
-                "Individual record marks",
-                "Address-date histogram",
-            ],
-            horizontal=True,
-        )
-
-        if distribution_view == "Density curve":
-            values = df_rent_trimmed["Rent_Owed"].to_numpy(dtype="float64")
-            sample_size = len(values)
-            standard_deviation = float(np.std(values, ddof=1))
-            q25, q75 = np.percentile(values, [25, 75])
-            robust_sigma = float((q75 - q25) / 1.349)
-            positive_scales = [
-                value
-                for value in [standard_deviation, robust_sigma]
-                if np.isfinite(value) and value > 0
-            ]
-            scale = min(positive_scales) if positive_scales else max(cutoff / 100, 1)
-            bandwidth = max(
-                0.9 * scale * sample_size ** (-1 / 5),
-                cutoff / 512,
-            )
-
-            counts, edges = np.histogram(values, bins=512, range=(0, cutoff))
-            centers = (edges[:-1] + edges[1:]) / 2
-            bin_width = edges[1] - edges[0]
-            sigma_bins = max(bandwidth / bin_width, 1.0)
-            radius = min(int(np.ceil(4 * sigma_bins)), 200)
-            kernel_axis = np.arange(-radius, radius + 1)
-            kernel = np.exp(-0.5 * (kernel_axis / sigma_bins) ** 2)
-            kernel /= kernel.sum()
-            density = np.convolve(counts, kernel, mode="same") / (
-                sample_size * bin_width
-            )
-
-            fig = go.Figure(
-                go.Scatter(
-                    x=centers,
-                    y=density,
-                    mode="lines",
-                    fill="tozeroy",
-                    line=dict(color="#2c5aa0", width=2.5),
-                    fillcolor="rgba(44, 90, 160, 0.18)",
-                    hovertemplate=(
-                        "<b>Reported rent owed: %{x:$,.0f}</b>"
-                        "<br>Estimated density: %{y:.3e}<extra></extra>"
-                    ),
-                )
-            )
-            median_rent = float(np.median(values))
-            mean_rent = float(np.mean(values))
-            fig.add_vline(
-                x=median_rent,
-                line_dash="dash",
-                line_color="#8c6d31",
-                annotation_text=f"Median ${median_rent:,.0f}",
-                annotation_position="top left",
-            )
-            fig.add_vline(
-                x=mean_rent,
-                line_dash="dot",
-                line_color="#756bb1",
-                annotation_text=f"Mean ${mean_rent:,.0f}",
-                annotation_position="top right",
-            )
-            fig.update_layout(
-                height=430,
-                margin=dict(l=75, r=25, t=45, b=65),
-                xaxis=dict(
-                    title="Reported rent owed per notice record",
-                    tickformat="$,.0f",
-                    rangemode="tozero",
-                    gridcolor="#e5e7eb",
-                ),
-                yaxis=dict(
-                    title="Estimated probability density",
-                    tickformat=".2e",
-                    rangemode="tozero",
-                    gridcolor="#e5e7eb",
-                ),
-                showlegend=False,
-                hoverlabel=dict(font_size=13),
-            )
-            st.plotly_chart(fig, width="stretch")
-            st.caption(
-                f"Gaussian kernel density estimate using all {sample_size:,} displayed "
-                f"notice records. Bandwidth: ${bandwidth:,.0f}, selected with a robust "
-                "Silverman rule. The same 95th-percentile cutoff and active filters apply."
-            )
-
-        elif distribution_view == "Individual record marks":
-            rent_values = np.ascontiguousarray(
-                df_rent_trimmed["Rent_Owed"].to_numpy(dtype="<f4")
-            )
-            encoded_values = base64.b64encode(rent_values.tobytes()).decode("ascii")
-            individualized_chart = """
-            <div id="rent-strip" style="font-family:system-ui,-apple-system,sans-serif;color:#273244">
-              <div style="font-size:13px;margin:0 0 6px 58px">
-                Each blue mark is one LAHD notice record
-              </div>
-              <canvas id="rent-canvas" role="img"
-                aria-label="Individual reported rent owed amounts with the highest five percent excluded"
-                style="display:block;width:100%;height:330px"></canvas>
-              <div style="text-align:center;font-size:13px;margin-top:6px">
-                Reported rent owed per notice record
-              </div>
-            </div>
-            <script>
-            (() => {
-              const canvas = document.getElementById("rent-canvas");
-              const ctx = canvas.getContext("2d");
-              const bytes = Uint8Array.from(atob("__VALUES__"), c => c.charCodeAt(0));
-              const values = new Float32Array(bytes.buffer);
-              const cutoff = __CUTOFF__;
-              const margins = {left: 58, right: 18, top: 16, bottom: 32};
-
-              function money(value) {
-                return "$" + Math.round(value).toLocaleString("en-US");
-              }
-
-              function draw() {
-                const dpr = Math.max(1, window.devicePixelRatio || 1);
-                const width = Math.max(520, canvas.clientWidth);
-                const height = 330;
-                canvas.width = Math.floor(width * dpr);
-                canvas.height = Math.floor(height * dpr);
-                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-                ctx.clearRect(0, 0, width, height);
-
-                const plotWidth = width - margins.left - margins.right;
-                const plotHeight = height - margins.top - margins.bottom;
-
-                ctx.strokeStyle = "#e5e7eb";
-                ctx.fillStyle = "#4b5563";
-                ctx.font = "12px system-ui, sans-serif";
-                ctx.textAlign = "center";
-                ctx.textBaseline = "top";
-                for (let tick = 0; tick <= 4; tick += 1) {
-                  const x = margins.left + plotWidth * tick / 4;
-                  ctx.beginPath();
-                  ctx.moveTo(x, margins.top);
-                  ctx.lineTo(x, margins.top + plotHeight);
-                  ctx.stroke();
-                  ctx.fillText(money(cutoff * tick / 4), x, margins.top + plotHeight + 8);
-                }
-
-                ctx.fillStyle = "#2c5aa0";
-                ctx.globalAlpha = 0.10;
-                for (let i = 0; i < values.length; i += 1) {
-                  const x = margins.left + (values[i] / cutoff) * plotWidth;
-                  const hash = Math.imul(i + 1, 2654435761) >>> 0;
-                  const y = margins.top + (hash / 4294967295) * plotHeight;
-                  ctx.fillRect(x, y, 1.5, 1.5);
-                }
-                ctx.globalAlpha = 1;
-
-                ctx.strokeStyle = "#9ca3af";
-                ctx.beginPath();
-                ctx.moveTo(margins.left, margins.top + plotHeight);
-                ctx.lineTo(width - margins.right, margins.top + plotHeight);
-                ctx.stroke();
-              }
-
-              new ResizeObserver(draw).observe(canvas);
-              draw();
-            })();
-            </script>
-            """
-            individualized_chart = individualized_chart.replace(
-                "__VALUES__", encoded_values
-            ).replace("__CUTOFF__", repr(cutoff))
-            components.html(individualized_chart, height=390)
-            st.caption(
-                "Every displayed notice is drawn as its own mark. Dense, darker areas "
-                "indicate many records with similar reported rent amounts; no buckets "
-                "or cumulative transformation are used."
-            )
-        else:
-            df_hist = ev_filtered[ev_filtered["Total_Rent_Owed"] > 0].copy()
-            node_cutoff = df_hist["Total_Rent_Owed"].quantile(0.95)
-            df_hist = df_hist[df_hist["Total_Rent_Owed"] <= node_cutoff]
-
-            fig = px.histogram(
-                df_hist,
-                x="Total_Rent_Owed",
-                nbins=40,
-                labels={"Total_Rent_Owed": "Total Rent Owed ($)"},
-            )
-            fig.update_traces(texttemplate="%{y}", textposition="outside")
-            fig.update_layout(
-                height=430,
-                margin=dict(l=70, r=20, t=70, b=60),
-                xaxis_tickformat="$,.0f",
-                yaxis_title="Address-date filing nodes",
             )
             st.plotly_chart(
                 fig,
                 width="stretch",
-                key="rent_hist_chart",
-                on_select=_update_rent_filter,
-                selection_mode="box",
+                key="trend_chart",
+                on_select=_update_trend_filter,
+                selection_mode="points",
             )
-            if st.session_state.get("rent_filter") is not None:
-                st.caption(
-                    "Rent owed histogram filter is active (use Clear Chart-Based "
-                    "Filters in the sidebar to reset)."
+            if st.session_state.get("trend_filter") is not None:
+                st.caption("Eviction trend filter is active (use 'Clear Chart-Based Filters' in the sidebar to reset).")
+
+# --- Zillow asking rent vs. LAHD reported rent owed ---
+with tab_cpi:
+    if tab_cpi.open:
+        st.subheader("Monthly asking rent and reported rent owed")
+        st.caption(
+            "Zillow ZORI is the unweighted average typical asking rent across ZIP codes represented "
+            "by the current filters. LAHD rent owed is the average positive balance reported on each "
+            "matched notice. A notice balance may cover multiple months, so the two lines are contextually "
+            "related but are not equivalent rent measures."
+        )
+
+        positive_owed_records = df_rent_records[df_rent_records["Rent_Owed"] > 0].copy()
+        eligible_zips = sorted(
+            zip_code for zip_code in ev_filtered["Zip"].dropna().astype(str).unique()
+            if zip_code
+        )
+
+        if ev_filtered.empty:
+            st.info("No eviction records match the current filters.")
+        elif not eligible_zips or zori_zip.empty or not zori_month_columns:
+            st.info("No Zillow ZIP observations match the current filtered eviction records.")
+        else:
+            comparison_start = ev_filtered["Date_Filed"].min().to_period("M").to_timestamp()
+            comparison_end = ev_filtered["Date_Filed"].max().to_period("M").to_timestamp()
+            comparison_months = pd.date_range(comparison_start, comparison_end, freq="MS")
+
+            zori_matrix = zori_zip.reindex(eligible_zips)[zori_month_columns].T
+            zori_matrix.index = pd.to_datetime(zori_matrix.index).to_period("M").to_timestamp()
+            zori_matrix = zori_matrix.loc[
+                (zori_matrix.index >= comparison_start)
+                & (zori_matrix.index <= comparison_end)
+            ]
+            zori_monthly = pd.DataFrame(
+                {
+                    "month": zori_matrix.index,
+                    "average_zori": zori_matrix.mean(axis=1, skipna=True).values,
+                    "zori_zip_count": zori_matrix.count(axis=1).values,
+                }
+            )
+
+            if positive_owed_records.empty:
+                owed_monthly = pd.DataFrame(columns=["month", "average_rent_owed", "notice_count"])
+            else:
+                positive_owed_records["month"] = (
+                    positive_owed_records["Date_Filed"].dt.to_period("M").dt.to_timestamp()
                 )
+                owed_monthly = (
+                    positive_owed_records.groupby("month", as_index=False)
+                    .agg(
+                        average_rent_owed=("Rent_Owed", "mean"),
+                        notice_count=("Rent_Owed", "size"),
+                    )
+                )
+
+            rent_comparison = pd.DataFrame({"month": comparison_months})
+            rent_comparison = rent_comparison.merge(zori_monthly, on="month", how="left")
+            rent_comparison = rent_comparison.merge(owed_monthly, on="month", how="left")
+            rent_comparison["zori_zip_count"] = rent_comparison["zori_zip_count"].fillna(0).astype(int)
+            rent_comparison["notice_count"] = rent_comparison["notice_count"].fillna(0).astype(int)
+
+            if rent_comparison[["average_zori", "average_rent_owed"]].notna().sum().sum() == 0:
+                st.info("No Zillow or positive rent-owed observations fall in this filtered period.")
+            else:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=rent_comparison["month"],
+                        y=rent_comparison["average_zori"],
+                        mode="lines+markers",
+                        name="Average ZIP asking rent (ZORI)",
+                        line={"color": "#2563eb", "width": 3},
+                        marker={"size": 6},
+                        customdata=rent_comparison[["zori_zip_count"]].to_numpy(),
+                        hovertemplate=(
+                            "%{x|%B %Y}<br>Average ZORI: $%{y:,.0f}"
+                            "<br>ZIP observations: %{customdata[0]:,}<extra></extra>"
+                        ),
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=rent_comparison["month"],
+                        y=rent_comparison["average_rent_owed"],
+                        mode="lines+markers",
+                        name="Average reported rent owed per notice",
+                        line={"color": "#ea580c", "width": 3},
+                        marker={"size": 6},
+                        customdata=rent_comparison[["notice_count"]].to_numpy(),
+                        hovertemplate=(
+                            "%{x|%B %Y}<br>Average reported owed: $%{y:,.0f}"
+                            "<br>Positive-balance notices: %{customdata[0]:,}<extra></extra>"
+                        ),
+                    )
+                )
+                fig.update_layout(
+                    height=470,
+                    margin=dict(l=40, r=20, t=30, b=40),
+                    yaxis_title="USD",
+                    yaxis_tickprefix="$",
+                    yaxis_tickformat=",.0f",
+                    hovermode="x unified",
+                    legend={"orientation": "h", "y": 1.08, "x": 0},
+                )
+                st.plotly_chart(fig, width="stretch")
+                st.download_button(
+                    "Download monthly rent comparison",
+                    rent_comparison.to_csv(index=False),
+                    "zillow_zori_vs_lahd_rent_owed.csv",
+                    "text/csv",
+                )
+
+        with st.expander("CPI rent-index context", expanded=False):
+            st.caption(f"{FRED_SERIES_ID}: US city average rent of primary residence; index 1982–1984=100. Source: {cpi_source}. This is an index, not a dollar rent.")
+            for note in cpi_notes:
+                st.info(note)
+            if cpi_df.empty or ev_filtered.empty:
+                st.info("CPI data could not be loaded for this view.")
+            else:
+                date_min = ev_filtered["Date_Filed"].min()
+                date_max = ev_filtered["Date_Filed"].max()
+                sub_cpi = cpi_df[
+                    (cpi_df["date"] >= date_min) & (cpi_df["date"] <= date_max)
+                ]
+                if sub_cpi.empty:
+                    st.info("No CPI observations in this date range.")
+                else:
+                    fig_cpi = px.line(
+                        sub_cpi,
+                        x="date",
+                        y="value",
+                        markers=True,
+                        labels={"date": "Date", "value": "CPI (Rent Index)"},
+                    )
+                    fig_cpi.update_layout(
+                        height=360,
+                        margin=dict(l=40, r=20, t=30, b=40),
+                        yaxis_title="CPI (Rent Index)",
+                        yaxis_tickformat=",.1f",
+                    )
+                    st.plotly_chart(fig_cpi, width="stretch")
+
+# --- Rent Owed Distribution (95% cutoff) ---
+with tab_hist:
+    if tab_hist.open:
+        st.subheader("Distribution of reported rent owed")
+        st.caption(
+            "The individualized histogram uses every LAHD notice with a positive rent-owed "
+            "amount; the top 5% are excluded. LAHD does not provide a verified unit "
+            "identifier, so records should not be interpreted as confirmed unique apartments."
+        )
+
+        df_rent_records = df_rent_records[df_rent_records["Rent_Owed"] > 0].copy()
+
+        if df_rent_records.empty:
+            st.info("No positive rent-owed values to display.")
+        else:
+            cutoff = float(df_rent_records["Rent_Owed"].quantile(0.95))
+            df_rent_trimmed = df_rent_records[
+                df_rent_records["Rent_Owed"] <= cutoff
+            ].copy()
+
+            metrics = st.columns(3)
+            metrics[0].metric("Notice records shown", f"{len(df_rent_trimmed):,}")
+            metrics[1].metric(
+                "Median reported rent owed",
+                f"${df_rent_trimmed['Rent_Owed'].median():,.0f}",
+            )
+            metrics[2].metric("95th-percentile cutoff", f"${cutoff:,.0f}")
+
+            distribution_view = st.radio(
+                "Distribution view",
+                [
+                    "Density curve",
+                    "Individual record marks",
+                    "Address-date histogram",
+                ],
+                horizontal=True,
+            )
+
+            if distribution_view == "Density curve":
+                values = df_rent_trimmed["Rent_Owed"].to_numpy(dtype="float64")
+                sample_size = len(values)
+                standard_deviation = float(np.std(values, ddof=1))
+                q25, q75 = np.percentile(values, [25, 75])
+                robust_sigma = float((q75 - q25) / 1.349)
+                positive_scales = [
+                    value
+                    for value in [standard_deviation, robust_sigma]
+                    if np.isfinite(value) and value > 0
+                ]
+                scale = min(positive_scales) if positive_scales else max(cutoff / 100, 1)
+                bandwidth = max(
+                    0.9 * scale * sample_size ** (-1 / 5),
+                    cutoff / 512,
+                )
+
+                counts, edges = np.histogram(values, bins=512, range=(0, cutoff))
+                centers = (edges[:-1] + edges[1:]) / 2
+                bin_width = edges[1] - edges[0]
+                sigma_bins = max(bandwidth / bin_width, 1.0)
+                radius = min(int(np.ceil(4 * sigma_bins)), 200)
+                kernel_axis = np.arange(-radius, radius + 1)
+                kernel = np.exp(-0.5 * (kernel_axis / sigma_bins) ** 2)
+                kernel /= kernel.sum()
+                density = np.convolve(counts, kernel, mode="same") / (
+                    sample_size * bin_width
+                )
+
+                fig = go.Figure(
+                    go.Scatter(
+                        x=centers,
+                        y=density,
+                        mode="lines",
+                        fill="tozeroy",
+                        line=dict(color="#2c5aa0", width=2.5),
+                        fillcolor="rgba(44, 90, 160, 0.18)",
+                        hovertemplate=(
+                            "<b>Reported rent owed: %{x:$,.0f}</b>"
+                            "<br>Estimated density: %{y:.3e}<extra></extra>"
+                        ),
+                    )
+                )
+                median_rent = float(np.median(values))
+                mean_rent = float(np.mean(values))
+                fig.add_vline(
+                    x=median_rent,
+                    line_dash="dash",
+                    line_color="#8c6d31",
+                    annotation_text=f"Median ${median_rent:,.0f}",
+                    annotation_position="top left",
+                )
+                fig.add_vline(
+                    x=mean_rent,
+                    line_dash="dot",
+                    line_color="#756bb1",
+                    annotation_text=f"Mean ${mean_rent:,.0f}",
+                    annotation_position="top right",
+                )
+                fig.update_layout(
+                    height=430,
+                    margin=dict(l=75, r=25, t=45, b=65),
+                    xaxis=dict(
+                        title="Reported rent owed per notice record",
+                        tickformat="$,.0f",
+                        rangemode="tozero",
+                        gridcolor="#e5e7eb",
+                    ),
+                    yaxis=dict(
+                        title="Estimated probability density",
+                        tickformat=".2e",
+                        rangemode="tozero",
+                        gridcolor="#e5e7eb",
+                    ),
+                    showlegend=False,
+                    hoverlabel=dict(font_size=13),
+                )
+                st.plotly_chart(fig, width="stretch")
+                st.caption(
+                    f"Gaussian kernel density estimate using all {sample_size:,} displayed "
+                    f"notice records. Bandwidth: ${bandwidth:,.0f}, selected with a robust "
+                    "Silverman rule. The same 95th-percentile cutoff and active filters apply."
+                )
+
+            elif distribution_view == "Individual record marks":
+                rent_values = np.ascontiguousarray(
+                    df_rent_trimmed["Rent_Owed"].to_numpy(dtype="<f4")
+                )
+                encoded_values = base64.b64encode(rent_values.tobytes()).decode("ascii")
+                individualized_chart = """
+                <div id="rent-strip" style="font-family:system-ui,-apple-system,sans-serif;color:#273244">
+                  <div style="font-size:13px;margin:0 0 6px 58px">
+                    Each blue mark is one LAHD notice record
+                  </div>
+                  <canvas id="rent-canvas" role="img"
+                    aria-label="Individual reported rent owed amounts with the highest five percent excluded"
+                    style="display:block;width:100%;height:330px"></canvas>
+                  <div style="text-align:center;font-size:13px;margin-top:6px">
+                    Reported rent owed per notice record
+                  </div>
+                </div>
+                <script>
+                (() => {
+                  const canvas = document.getElementById("rent-canvas");
+                  const ctx = canvas.getContext("2d");
+                  const bytes = Uint8Array.from(atob("__VALUES__"), c => c.charCodeAt(0));
+                  const values = new Float32Array(bytes.buffer);
+                  const cutoff = __CUTOFF__;
+                  const margins = {left: 58, right: 18, top: 16, bottom: 32};
+
+                  function money(value) {
+                    return "$" + Math.round(value).toLocaleString("en-US");
+                  }
+
+                  function draw() {
+                    const dpr = Math.max(1, window.devicePixelRatio || 1);
+                    const width = Math.max(520, canvas.clientWidth);
+                    const height = 330;
+                    canvas.width = Math.floor(width * dpr);
+                    canvas.height = Math.floor(height * dpr);
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    ctx.clearRect(0, 0, width, height);
+
+                    const plotWidth = width - margins.left - margins.right;
+                    const plotHeight = height - margins.top - margins.bottom;
+
+                    ctx.strokeStyle = "#e5e7eb";
+                    ctx.fillStyle = "#4b5563";
+                    ctx.font = "12px system-ui, sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "top";
+                    for (let tick = 0; tick <= 4; tick += 1) {
+                      const x = margins.left + plotWidth * tick / 4;
+                      ctx.beginPath();
+                      ctx.moveTo(x, margins.top);
+                      ctx.lineTo(x, margins.top + plotHeight);
+                      ctx.stroke();
+                      ctx.fillText(money(cutoff * tick / 4), x, margins.top + plotHeight + 8);
+                    }
+
+                    ctx.fillStyle = "#2c5aa0";
+                    ctx.globalAlpha = 0.10;
+                    for (let i = 0; i < values.length; i += 1) {
+                      const x = margins.left + (values[i] / cutoff) * plotWidth;
+                      const hash = Math.imul(i + 1, 2654435761) >>> 0;
+                      const y = margins.top + (hash / 4294967295) * plotHeight;
+                      ctx.fillRect(x, y, 1.5, 1.5);
+                    }
+                    ctx.globalAlpha = 1;
+
+                    ctx.strokeStyle = "#9ca3af";
+                    ctx.beginPath();
+                    ctx.moveTo(margins.left, margins.top + plotHeight);
+                    ctx.lineTo(width - margins.right, margins.top + plotHeight);
+                    ctx.stroke();
+                  }
+
+                  new ResizeObserver(draw).observe(canvas);
+                  draw();
+                })();
+                </script>
+                """
+                individualized_chart = individualized_chart.replace(
+                    "__VALUES__", encoded_values
+                ).replace("__CUTOFF__", repr(cutoff))
+                embed_html(individualized_chart, height=390)
+                st.caption(
+                    "Every displayed notice is drawn as its own mark. Dense, darker areas "
+                    "indicate many records with similar reported rent amounts; no buckets "
+                    "or cumulative transformation are used."
+                )
+            else:
+                df_hist = ev_filtered[ev_filtered["Total_Rent_Owed"] > 0].copy()
+                node_cutoff = df_hist["Total_Rent_Owed"].quantile(0.95)
+                df_hist = df_hist[df_hist["Total_Rent_Owed"] <= node_cutoff]
+
+                fig = px.histogram(
+                    df_hist,
+                    x="Total_Rent_Owed",
+                    nbins=40,
+                    labels={"Total_Rent_Owed": "Total Rent Owed ($)"},
+                )
+                # Bin counts belong in hover details, not overlapping text labels.
+                fig.update_traces(hovertemplate="Reported rent: %{x}<br>Address-date nodes: %{y:,.0f}<extra></extra>")
+                fig.update_layout(
+                    height=430,
+                    margin=dict(l=70, r=20, t=70, b=60),
+                    xaxis_tickformat="$,.0f",
+                    yaxis_title="Address-date filing nodes",
+                )
+                st.plotly_chart(
+                    fig,
+                    width="stretch",
+                    key="rent_hist_chart",
+                    on_select=_update_rent_filter,
+                    selection_mode="box",
+                )
+                if st.session_state.get("rent_filter") is not None:
+                    st.caption(
+                        "Rent owed histogram filter is active (use Clear Chart-Based "
+                        "Filters in the sidebar to reset)."
+                    )
 
 # --- Eviction Causes ---
 with tab_causes:
-    st.subheader("Eviction causes")
-    st.caption(
-        "Each address-date node appears once. Records listing more than one LAHD cause "
-        "are grouped as Multiple stated causes. Bars are ranked by affected tenants."
-    )
-    df_causes = ev_filtered.copy()
-
-    if df_causes.empty:
-        st.info("No cause records to display.")
-    else:
-        cause_sum = (
-            df_causes.groupby("Cause_Category", as_index=False)["Eviction_Count"]
-            .sum()
-            .rename(columns={"Eviction_Count": "total_evictions"})
-            .sort_values("total_evictions", ascending=False)
+    if tab_causes.open:
+        st.subheader("Eviction causes")
+        st.caption(
+            "Each address-date node appears once. Records listing more than one LAHD cause "
+            "are grouped as Multiple stated causes. Bars are ranked by affected tenants."
         )
+        df_causes = ev_filtered.copy()
 
-        chart_total = int(cause_sum["total_evictions"].sum())
-        cause_sum["share"] = cause_sum["total_evictions"] / chart_total
-        cause_sum["display_label"] = cause_sum.apply(
-            lambda row: f"{int(row['total_evictions']):,}  ({row['share']:.1%})",
-            axis=1,
-        )
-        cause_sum = cause_sum.sort_values("total_evictions", ascending=True)
-
-        # Category names already identify each bar, so color is reserved for emphasis.
-        bar_colors = [
-            "#08519c" if category == "Non-payment of rent" else "#6baed6"
-            for category in cause_sum["Cause_Category"]
-        ]
-
-        fig = go.Figure(
-            go.Bar(
-                x=cause_sum["total_evictions"],
-                y=cause_sum["Cause_Category"],
-                orientation="h",
-                text=cause_sum["display_label"],
-                textposition="outside",
-                textfont=dict(size=13, color="#172033"),
-                cliponaxis=False,
-                marker_color=bar_colors,
-                customdata=cause_sum[["share"]],
-                hovertemplate=(
-                    "<b>%{y}</b><br>%{x:,.0f} affected tenants"
-                    "<br>%{customdata[0]:.1%} of filtered total<extra></extra>"
-                ),
-            )
-        )
-        fig.update_layout(
-            height=500,
-            margin=dict(l=190, r=135, t=20, b=60),
-            bargap=0.28,
-            showlegend=False,
-            xaxis_title="Affected tenants",
-            yaxis_title="",
-            xaxis_tickformat=",.0f",
-            xaxis=dict(gridcolor="#e5e7eb", tickfont=dict(size=12)),
-            yaxis=dict(tickfont=dict(size=13, color="#273244")),
-            hoverlabel=dict(font_size=13),
-        )
-        st.plotly_chart(fig, width="stretch")
-        st.caption(f"Filtered total: {chart_total:,} affected tenants.")
-
-        with st.expander("View detailed LAHD source terms"):
-            source_terms = (
-                df_causes[["Cause", "Eviction_Count"]]
-                .assign(Source_Term=df_causes["Cause"].map(split_cause_terms))
-                .explode("Source_Term")
-            )
-            source_terms = source_terms[source_terms["Source_Term"].notna()]
-            source_term_summary = (
-                source_terms.groupby("Source_Term", as_index=False)["Eviction_Count"]
+        if df_causes.empty:
+            st.info("No cause records to display.")
+        else:
+            cause_sum = (
+                df_causes.groupby("Cause_Category", as_index=False)["Eviction_Count"]
                 .sum()
-                .rename(columns={"Eviction_Count": "Affected tenants mentioning term"})
-                .sort_values("Affected tenants mentioning term", ascending=False)
+                .rename(columns={"Eviction_Count": "total_evictions"})
+                .sort_values("total_evictions", ascending=False)
             )
-            st.caption(
-                "A record with multiple stated causes appears under each applicable source term, "
-                "so this detail table is not a part-to-whole total."
+
+            chart_total = int(cause_sum["total_evictions"].sum())
+            cause_sum["share"] = cause_sum["total_evictions"] / chart_total
+            cause_sum["display_label"] = cause_sum.apply(
+                lambda row: f"{int(row['total_evictions']):,}  ({row['share']:.1%})",
+                axis=1,
             )
-            st.dataframe(source_term_summary, hide_index=True, width="stretch")
+            cause_sum = cause_sum.sort_values("total_evictions", ascending=True)
+
+            # Category names already identify each bar, so color is reserved for emphasis.
+            bar_colors = [
+                "#08519c" if category == "Non-payment of rent" else "#6baed6"
+                for category in cause_sum["Cause_Category"]
+            ]
+
+            fig = go.Figure(
+                go.Bar(
+                    x=cause_sum["total_evictions"],
+                    y=cause_sum["Cause_Category"],
+                    orientation="h",
+                    text=cause_sum["display_label"],
+                    textposition="outside",
+                    textfont=dict(size=13, color="#172033"),
+                    cliponaxis=False,
+                    marker_color=bar_colors,
+                    customdata=cause_sum[["share"]],
+                    hovertemplate=(
+                        "<b>%{y}</b><br>%{x:,.0f} affected tenants"
+                        "<br>%{customdata[0]:.1%} of filtered total<extra></extra>"
+                    ),
+                )
+            )
+            fig.update_layout(
+                height=500,
+                margin=dict(l=190, r=135, t=20, b=60),
+                bargap=0.28,
+                showlegend=False,
+                xaxis_title="Affected tenants",
+                yaxis_title="",
+                xaxis_tickformat=",.0f",
+                xaxis=dict(gridcolor="#e5e7eb", tickfont=dict(size=12)),
+                yaxis=dict(tickfont=dict(size=13, color="#273244")),
+                hoverlabel=dict(font_size=13),
+            )
+            st.plotly_chart(fig, width="stretch")
+            st.caption(f"Filtered total: {chart_total:,} affected tenants.")
+
+            with st.expander("View detailed LAHD source terms"):
+                source_terms = (
+                    df_causes[["Cause", "Eviction_Count"]]
+                    .assign(Source_Term=df_causes["Cause"].map(split_cause_terms))
+                    .explode("Source_Term")
+                )
+                source_terms = source_terms[source_terms["Source_Term"].notna()]
+                source_term_summary = (
+                    source_terms.groupby("Source_Term", as_index=False)["Eviction_Count"]
+                    .sum()
+                    .rename(columns={"Eviction_Count": "Affected tenants mentioning term"})
+                    .sort_values("Affected tenants mentioning term", ascending=False)
+                )
+                st.caption(
+                    "A record with multiple stated causes appears under each applicable source term, "
+                    "so this detail table is not a part-to-whole total."
+                )
+                st.dataframe(source_term_summary, hide_index=True, width="stretch")
 
 # --- Demographics (Census) ---
 with tab_demo:
-    st.subheader("Neighborhood Demographic Based on Census Data (Irrespective of Evictions)")
-    with st.expander("What do these demographic columns mean?"):
-        st.markdown("`White_share`, `Black_share`, `Hispanic_share`, `Asian_share`, and `Other_share` are neighborhood population percentages: 4.7 means 4.7%, not 0.047%. They describe residents of the neighborhood, not tenants named in notices. In the supplied file the five columns sum to 100%. `Other_share` is the residual category outside the four named groups. The original Census variable crosswalk is not included, so its exact racial/ethnic membership and treatment of multiracial residents cannot be verified. Do not interpret it as other eviction causes or missing notice data.")
-        st.markdown("`median_income` and `median_rent` are supplied neighborhood dollar estimates. `rent_burden_pct` is a supplied percentage; its denominator and threshold require the original source documentation. The All Areas display is an unweighted average of neighborhoods, not a population-weighted Los Angeles estimate.")
+    if tab_demo.open:
+        st.subheader("Neighborhood Demographic Based on Census Data (Irrespective of Evictions)")
+        with st.expander("What do these demographic columns mean?"):
+            st.markdown("`White_share`, `Black_share`, `Hispanic_share`, `Asian_share`, and `Other_share` are neighborhood population percentages: 4.7 means 4.7%, not 0.047%. They describe residents of the neighborhood, not tenants named in notices. In the supplied file the five columns sum to 100%. `Other_share` is the residual category outside the four named groups. The original Census variable crosswalk is not included, so its exact racial/ethnic membership and treatment of multiracial residents cannot be verified. Do not interpret it as other eviction causes or missing notice data.")
+            st.markdown("`median_income` and `median_rent` are supplied neighborhood dollar estimates. `rent_burden_pct` is a supplied percentage; its denominator and threshold require the original source documentation. The All Areas display is an unweighted average of neighborhoods, not a population-weighted Los Angeles estimate.")
 
-    if census_df.empty:
-        st.info(
-            "No census file found. To enable this panel, create "
-            "`data/neighborhood_census.csv` with columns like: "
-            "`name, median_income, median_rent, rent_burden_pct, "
-            "White_share, Black_share, Hispanic_share, Asian_share, Other_share`."
-        )
-    else:
-        # Build dropdown options: special "All Areas" + all individual neighborhoods
-        area_options = ["All Areas (Los Angeles)"] + sorted(
-            census_df["name"].unique().tolist()
-        )
-
-        # Default selection: if current map area is a neighborhood in census_df, use that
-        default_index = 0
-        if selected_area in census_df["name"].values:
-            try:
-                default_index = area_options.index(selected_area)
-            except ValueError:
-                default_index = 0
-
-        demo_area = st.selectbox(
-            "Select area for demographics",
-            options=area_options,
-            index=default_index,
-        )
-
-        # If user picks the special "All Areas" option, compute an aggregate row
-        if demo_area == "All Areas (Los Angeles)":
-            # Take simple (unweighted) averages for numeric columns
-            numeric_cols = census_df.select_dtypes(include=[np.number]).columns
-            agg_series = census_df[numeric_cols].mean()
-            agg_series["name"] = "All Areas (Los Angeles)"
-            row = agg_series
-        else:
-            row = census_df[census_df["name"] == demo_area].iloc[0]
-
-        st.markdown(f"**Area:** `{row['name']}`")
-
-        cols_demo = st.columns(1)
-        with cols_demo[0]:
-            if "rent_burden_pct" in row:
-                st.metric(
-                    "Reported rent burden (source definition unverified)",
-                    f"{row['rent_burden_pct']:.1f}%",
-                )
-
-        race_cols = [
-            "White_share",
-            "Black_share",
-            "Hispanic_share",
-            "Asian_share",
-            "Other_share",
-        ]
-        existing_race_cols = [c for c in race_cols if c in row.index]
-        if existing_race_cols:
-            race_vals = [row[c] for c in existing_race_cols]
-            race_labels = [
-                c.replace("_share", "").replace("_", " ")
-                for c in existing_race_cols
-            ]
-            race_df = pd.DataFrame({"group": race_labels, "share": race_vals})
-
-            race_colors = {
-                "White": "#9ecae1",
-                "Black": "#6baed6",
-                "Hispanic": "#4292c6",
-                "Asian": "#2171b5",
-                "Other": "#084594",
-            }
-
-            fig_demo = px.pie(
-                race_df,
-                names="group",
-                values="share",
-                title="Racial/Ethnic Composition of area (separate from rent and evictions data)",
-                color="group",
-                color_discrete_map=race_colors,
+        if census_df.empty:
+            st.info(
+                "No census file found. To enable this panel, create "
+                "`data/neighborhood_census.csv` with columns like: "
+                "`name, median_income, median_rent, rent_burden_pct, "
+                "White_share, Black_share, Hispanic_share, Asian_share, Other_share`."
             )
-            fig_demo.update_traces(textposition="inside", textinfo="label+percent")
-            fig_demo.update_layout(height=360, margin=dict(l=20, r=20, t=60, b=40))
-            st.plotly_chart(fig_demo, width="stretch")
         else:
-            st.info("No racial composition columns found in census file.")
+            # Build dropdown options: special "All Areas" + all individual neighborhoods
+            area_options = ["All Areas (Los Angeles)"] + sorted(
+                census_df["name"].unique().tolist()
+            )
+
+            # Default selection: if current map area is a neighborhood in census_df, use that
+            default_index = 0
+            if selected_area in census_df["name"].values:
+                try:
+                    default_index = area_options.index(selected_area)
+                except ValueError:
+                    default_index = 0
+
+            demo_area = st.selectbox(
+                "Select area for demographics",
+                options=area_options,
+                index=default_index,
+            )
+
+            # If user picks the special "All Areas" option, compute an aggregate row
+            if demo_area == "All Areas (Los Angeles)":
+                # Take simple (unweighted) averages for numeric columns
+                numeric_cols = census_df.select_dtypes(include=[np.number]).columns
+                agg_series = census_df[numeric_cols].mean()
+                agg_series["name"] = "All Areas (Los Angeles)"
+                row = agg_series
+            else:
+                row = census_df[census_df["name"] == demo_area].iloc[0]
+
+            st.markdown(f"**Area:** `{row['name']}`")
+
+            cols_demo = st.columns(1)
+            with cols_demo[0]:
+                if "rent_burden_pct" in row:
+                    st.metric(
+                        "Reported rent burden (source definition unverified)",
+                        f"{row['rent_burden_pct']:.1f}%",
+                    )
+
+            race_cols = [
+                "White_share",
+                "Black_share",
+                "Hispanic_share",
+                "Asian_share",
+                "Other_share",
+            ]
+            existing_race_cols = [c for c in race_cols if c in row.index]
+            if existing_race_cols:
+                race_vals = [row[c] for c in existing_race_cols]
+                race_labels = [
+                    c.replace("_share", "").replace("_", " ")
+                    for c in existing_race_cols
+                ]
+                race_df = pd.DataFrame({"group": race_labels, "share": race_vals})
+
+                race_colors = {
+                    "White": "#9ecae1",
+                    "Black": "#6baed6",
+                    "Hispanic": "#4292c6",
+                    "Asian": "#2171b5",
+                    "Other": "#084594",
+                }
+
+                fig_demo = px.pie(
+                    race_df,
+                    names="group",
+                    values="share",
+                    title="Racial/Ethnic Composition of area (separate from rent and evictions data)",
+                    color="group",
+                    color_discrete_map=race_colors,
+                )
+                fig_demo.update_traces(textposition="inside", textinfo="label+percent")
+                fig_demo.update_layout(height=360, margin=dict(l=20, r=20, t=60, b=40))
+                st.plotly_chart(fig_demo, width="stretch")
+            else:
+                st.info("No racial composition columns found in census file.")
 
 # ==============================
 # RESEARCH LAB — PROPERTY, PLACE, POLICY, AND EXPORTS
@@ -2927,389 +2971,402 @@ st.caption("Exploratory tools; correlations do not establish causation.")
         "Reports & sharing",
         "Methods & resources",
         "Data admin",
-    ]
+    ], on_change="rerun", key="alpha_research_tabs",
 )
 
 with tab_routine:
-    st.subheader("Routine and infrequent filing addresses")
-    st.caption("A retrospective comparison of notice activity, inspired by the supplied chart. Addresses are proxies for properties; these data do not identify verified landlords or completed evictions.")
-    routine_controls = st.columns(3)
-    threshold = routine_controls[0].number_input("Routine: minimum active months", min_value=2, max_value=36, value=6,
-        help="An address is routine if it has notices in at least this many distinct calendar months within the selected period. This is an adjustable research definition, not an official designation.")
-    period_label = routine_controls[1].selectbox("Group notices by", ["Year", "Month"])
-    measure_label = routine_controls[2].selectbox("Chart measure", ["Notice counts", "Share of notices (%)"])
-    routine_summary, routine_addresses = routine_filer_summary(ev_filtered, int(threshold), "Y" if period_label == "Year" else "M")
-    if routine_summary.empty:
-        st.info("No notice activity matches the current filters.")
-    else:
-        cohort_sizes = routine_addresses["cohort"].value_counts()
-        routine_counts = routine_addresses.groupby("cohort")["notices"].sum()
-        cards = st.columns(3)
-        cards[0].metric("Routine addresses", f"{cohort_sizes.get('Routine', 0):,}")
-        cards[1].metric("Infrequent addresses", f"{cohort_sizes.get('Infrequent', 0):,}")
-        cards[2].metric("Routine share of selected notices", f"{100 * routine_counts.get('Routine', 0) / routine_counts.sum():.1f}%")
-        measure = "notices" if measure_label == "Notice counts" else "share_percent"
-        figure = go.Figure()
-        for cohort, color, fill in [("Routine", "#eb4b00", "rgba(235,75,0,0.25)"), ("Infrequent", "#484b80", "rgba(72,75,128,0.25)")]:
-            series = routine_summary[routine_summary["cohort"].eq(cohort)]
-            figure.add_trace(go.Scatter(x=series["period"], y=series[measure], mode="lines+markers",
-                stackgroup="notices", name=f"{cohort} · {cohort_sizes.get(cohort, 0):,} addresses",
-                line={"color": color, "width": 3}, fillcolor=fill,
-                customdata=series[["notices", "share_percent"]].to_numpy(),
-                hovertemplate="%{x|%b %Y}<br>%{customdata[0]:,.0f} notices<br>%{customdata[1]:.1f}% of period notices<extra>%{fullData.name}</extra>"))
-        figure.update_layout(title=f"Contribution to notice volume by {period_label.lower()} — {selected_area}",
-            height=490, plot_bgcolor="#f4f6f8", paper_bgcolor="#f4f6f8",
-            font={"color": "#25292c"}, legend={"orientation": "h", "y": -0.22, "x": 0.5, "xanchor": "center"},
-            margin={"l": 45, "r": 25, "t": 70, "b": 100},
-            yaxis={"title": measure_label, "rangemode": "tozero", "gridcolor": "white"},
-            xaxis={"title": None, "tickformat": "%Y" if period_label == "Year" else "%b %Y"})
-        if measure == "share_percent":
-            figure.update_yaxes(range=[0, 100], ticksuffix="%")
-        st.plotly_chart(figure, width="stretch")
-        st.caption(f"Routine = notices in at least {threshold} separate months across the selected period. Cohort membership is fixed across this chart but recalculates when filters change. Orange is routine volume; the combined top boundary is total volume. First/last years may be partial. Counts are affected by property size and geocoding coverage. A true rate requires a compatible rental-unit or renter-household denominator.")
-        with st.expander("Explore routine addresses and download the calculation"):
-            st.dataframe(routine_addresses, hide_index=True, width="stretch")
-            st.download_button("Download routine/infrequent time series", routine_summary.to_csv(index=False), "routine_filing_contribution.csv", "text/csv")
-            st.download_button("Download address classifications", routine_addresses.to_csv(index=False), "routine_address_classifications.csv", "text/csv")
+    if tab_routine.open:
+        st.subheader("Routine and infrequent filing addresses")
+        st.caption("A retrospective comparison of notice activity, inspired by the supplied chart. Addresses are proxies for properties; these data do not identify verified landlords or completed evictions.")
+        routine_controls = st.columns(3)
+        threshold = routine_controls[0].number_input("Routine: minimum active months", min_value=2, max_value=36, value=6,
+            help="An address is routine if it has notices in at least this many distinct calendar months within the selected period. This is an adjustable research definition, not an official designation.")
+        period_label = routine_controls[1].selectbox("Group notices by", ["Year", "Month"])
+        measure_label = routine_controls[2].selectbox("Chart measure", ["Notice counts", "Share of notices (%)"])
+        routine_summary, routine_addresses = routine_filer_summary(ev_filtered, int(threshold), "Y" if period_label == "Year" else "M")
+        if routine_summary.empty:
+            st.info("No notice activity matches the current filters.")
+        else:
+            cohort_sizes = routine_addresses["cohort"].value_counts()
+            routine_counts = routine_addresses.groupby("cohort")["notices"].sum()
+            cards = st.columns(3)
+            cards[0].metric("Routine addresses", f"{cohort_sizes.get('Routine', 0):,}")
+            cards[1].metric("Infrequent addresses", f"{cohort_sizes.get('Infrequent', 0):,}")
+            cards[2].metric("Routine share of selected notices", f"{100 * routine_counts.get('Routine', 0) / routine_counts.sum():.1f}%")
+            measure = "notices" if measure_label == "Notice counts" else "share_percent"
+            figure = go.Figure()
+            for cohort, color, fill in [("Routine", "#eb4b00", "rgba(235,75,0,0.25)"), ("Infrequent", "#484b80", "rgba(72,75,128,0.25)")]:
+                series = routine_summary[routine_summary["cohort"].eq(cohort)]
+                figure.add_trace(go.Scatter(x=series["period"], y=series[measure], mode="lines+markers",
+                    stackgroup="notices", name=f"{cohort} · {cohort_sizes.get(cohort, 0):,} addresses",
+                    line={"color": color, "width": 3}, fillcolor=fill,
+                    customdata=series[["notices", "share_percent"]].to_numpy(),
+                    hovertemplate="%{x|%b %Y}<br>%{customdata[0]:,.0f} notices<br>%{customdata[1]:.1f}% of period notices<extra>%{fullData.name}</extra>"))
+            figure.update_layout(title=f"Contribution to notice volume by {period_label.lower()} — {selected_area}",
+                height=490, plot_bgcolor="#f4f6f8", paper_bgcolor="#f4f6f8",
+                font={"color": "#25292c"}, legend={"orientation": "h", "y": -0.22, "x": 0.5, "xanchor": "center"},
+                margin={"l": 45, "r": 25, "t": 70, "b": 100},
+                yaxis={"title": measure_label, "rangemode": "tozero", "gridcolor": "white"},
+                xaxis={"title": None, "tickformat": "%Y" if period_label == "Year" else "%b %Y"})
+            if measure == "share_percent":
+                figure.update_yaxes(range=[0, 100], ticksuffix="%")
+            st.plotly_chart(figure, width="stretch")
+            st.caption(f"Routine = notices in at least {threshold} separate months across the selected period. Cohort membership is fixed across this chart but recalculates when filters change. Orange is routine volume; the combined top boundary is total volume. First/last years may be partial. Counts are affected by property size and geocoding coverage. A true rate requires a compatible rental-unit or renter-household denominator.")
+            with st.expander("Explore routine addresses and download the calculation"):
+                st.dataframe(routine_addresses, hide_index=True, width="stretch")
+                st.download_button("Download routine/infrequent time series", routine_summary.to_csv(index=False), "routine_filing_contribution.csv", "text/csv")
+                st.download_button("Download address classifications", routine_addresses.to_csv(index=False), "routine_address_classifications.csv", "text/csv")
 
 with tab_property:
-    st.subheader("Address history and parcel profiles")
-    address_table = address_profiles(ev_filtered)
-    parcel_table = property_profiles(ev_filtered)
-    profile_mode = st.radio("Profile by", ["Address", "Parcel / APN"], horizontal=True)
-    if profile_mode == "Address":
-        choices = address_table["full_address"].tolist()
-        chosen = st.selectbox("Address", choices, index=0 if choices else None)
-        if chosen:
-            history = ev_filtered[ev_filtered["full_address"] == chosen].sort_values("Date_Filed")
-            profile = address_table[address_table["full_address"] == chosen].iloc[0]
-            cols = st.columns(4)
-            cols[0].metric("Filing dates", f"{int(profile['filing_nodes']):,}")
-            cols[1].metric("Notice records", f"{int(profile['affected_tenants']):,}")
-            cols[2].metric("Reported rent", f"${profile['total_rent_owed']:,.0f}")
-            cols[3].metric("APN(s)", profile["apns"][:24])
-            fig_history = px.bar(
-                history,
-                x="Date_Filed",
-                y="Eviction_Count",
-                color="Cause",
-                hover_data=["Total_Rent_Owed", "Apn"],
-                title="Filing timeline",
-            )
-            st.plotly_chart(fig_history, width="stretch")
-            st.dataframe(history[["Date_Filed", "Eviction_Count", "Cause", "Total_Rent_Owed", "Apn"]], width="stretch")
-    else:
-        apns = parcel_table["Apn"].tolist()
-        chosen_apn = st.selectbox("Parcel / APN", apns, index=0 if apns else None)
-        if chosen_apn:
-            parcel_rows = ev_filtered[ev_filtered["Apn"] == chosen_apn].sort_values("Date_Filed")
-            st.dataframe(parcel_rows[["full_address", "Date_Filed", "Eviction_Count", "Cause", "Total_Rent_Owed"]], width="stretch")
-
-    st.markdown("#### Optional ownership crosswalk")
-    st.caption("The eviction source does not contain verified owner names. Upload a CSV with `Apn` and `owner_name`; optional `network_name` links related LLCs.")
-    owner_file = st.file_uploader("Owner/APN crosswalk", type="csv", key="owner_crosswalk")
-    if owner_file is not None:
-        owner_map = pd.read_csv(owner_file, dtype=str)
-        if {"Apn", "owner_name"}.issubset(owner_map.columns):
-            ownership = ev_filtered.merge(owner_map, on="Apn", how="left")
-            group_field = "network_name" if "network_name" in ownership.columns else "owner_name"
-            owner_summary = (
-                ownership.dropna(subset=[group_field])
-                .groupby(group_field, as_index=False)
-                .agg(parcels=("Apn", "nunique"), addresses=("full_address", "nunique"), affected_tenants=("Eviction_Count", "sum"), rent_owed=("Total_Rent_Owed", "sum"))
-                .sort_values("affected_tenants", ascending=False)
-            )
-            st.dataframe(owner_summary, width="stretch")
+    if tab_property.open:
+        st.subheader("Address history and parcel profiles")
+        address_table = address_profiles(ev_filtered)
+        parcel_table = property_profiles(ev_filtered)
+        profile_mode = st.radio("Profile by", ["Address", "Parcel / APN"], horizontal=True)
+        if profile_mode == "Address":
+            choices = address_table["full_address"].tolist()
+            chosen = st.selectbox("Address", choices, index=0 if choices else None)
+            if chosen:
+                history = ev_filtered[ev_filtered["full_address"] == chosen].sort_values("Date_Filed")
+                profile = address_table[address_table["full_address"] == chosen].iloc[0]
+                cols = st.columns(4)
+                cols[0].metric("Filing dates", f"{int(profile['filing_nodes']):,}")
+                cols[1].metric("Notice records", f"{int(profile['affected_tenants']):,}")
+                cols[2].metric("Reported rent", f"${profile['total_rent_owed']:,.0f}")
+                cols[3].metric("APN(s)", profile["apns"][:24])
+                fig_history = px.bar(
+                    history,
+                    x="Date_Filed",
+                    y="Eviction_Count",
+                    color="Cause_Category",
+                    hover_data=["Total_Rent_Owed", "Apn"],
+                    title="Reported-notice timeline",
+                    labels={"Date_Filed": "Date received", "Eviction_Count": "Notice records",
+                            "Cause_Category": "Cause category", "Total_Rent_Owed": "Reported rent owed ($)"},
+                )
+                st.plotly_chart(readable_timeline(fig_history), width="stretch")
+                st.dataframe(history[["Date_Filed", "Eviction_Count", "Cause", "Total_Rent_Owed", "Apn"]], width="stretch")
         else:
-            st.error("Crosswalk must contain `Apn` and `owner_name`.")
+            apns = parcel_table["Apn"].tolist()
+            chosen_apn = st.selectbox("Parcel / APN", apns, index=0 if apns else None)
+            if chosen_apn:
+                parcel_rows = ev_filtered[ev_filtered["Apn"] == chosen_apn].sort_values("Date_Filed")
+                st.dataframe(parcel_rows[["full_address", "Date_Filed", "Eviction_Count", "Cause", "Total_Rent_Owed"]], width="stretch")
+
+        st.markdown("#### Optional ownership crosswalk")
+        st.caption("The eviction source does not contain verified owner names. Upload a CSV with `Apn` and `owner_name`; optional `network_name` links related LLCs.")
+        owner_file = st.file_uploader("Owner/APN crosswalk", type="csv", key="owner_crosswalk")
+        if owner_file is not None:
+            owner_map = pd.read_csv(owner_file, dtype=str)
+            if {"Apn", "owner_name"}.issubset(owner_map.columns):
+                ownership = ev_filtered.merge(owner_map, on="Apn", how="left")
+                group_field = "network_name" if "network_name" in ownership.columns else "owner_name"
+                owner_summary = (
+                    ownership.dropna(subset=[group_field])
+                    .groupby(group_field, as_index=False)
+                    .agg(parcels=("Apn", "nunique"), addresses=("full_address", "nunique"), affected_tenants=("Eviction_Count", "sum"), rent_owed=("Total_Rent_Owed", "sum"))
+                    .sort_values("affected_tenants", ascending=False)
+                )
+                st.dataframe(owner_summary, width="stretch")
+            else:
+                st.error("Crosswalk must contain `Apn` and `owner_name`.")
 
 with tab_compare:
-    st.subheader("Neighborhood comparison and normalized rates")
-    if nbhd.empty:
-        st.info("Neighborhood geometry is unavailable.")
-    else:
-        points = gpd.GeoDataFrame(
-            ev_filtered.copy(),
-            geometry=gpd.points_from_xy(ev_filtered["long"], ev_filtered["lat"]),
-            crs="EPSG:4326",
-        )
-        area_join = gpd.sjoin(points, nbhd[["name", "geometry"]], how="inner", predicate="within")
-        area_metrics = (
-            area_join.groupby("name", as_index=False)
-            .agg(evictions_total=("Eviction_Count", "sum"), filing_nodes=("full_address", "size"), unique_addresses=("full_address", "nunique"), rent_owed=("Total_Rent_Owed", "sum"))
-        )
-        if not census_df.empty:
-            area_metrics = area_metrics.merge(census_df, on="name", how="left")
-        denominators_file = st.file_uploader("Optional denominators CSV (`name`, `renter_households`)", type="csv", key="denominators")
-        if denominators_file is not None:
-            denominators = pd.read_csv(denominators_file)
-            if {"name", "renter_households"}.issubset(denominators.columns):
-                area_metrics = area_metrics.merge(denominators[["name", "renter_households"]], on="name", how="left")
-                area_metrics["notices_per_1000_renter_households"] = area_metrics["evictions_total"] / area_metrics["renter_households"] * 1000
-                rate_metric = "notices_per_1000_renter_households"
-            else:
-                st.error("Denominator file needs `name` and `renter_households`.")
-                rate_metric = "evictions_total"
+    if tab_compare.open:
+        st.subheader("Neighborhood comparison and normalized rates")
+        if nbhd.empty:
+            st.info("Neighborhood geometry is unavailable.")
         else:
-            rate_metric = "evictions_total"
-            st.info("Upload renter-household denominators to calculate comparable rates per 1,000. Raw counts are shown until then.")
-        compare_names = st.multiselect("Choose 2–6 neighborhoods", sorted(area_metrics["name"].unique()), max_selections=6)
-        compare_df = area_metrics[area_metrics["name"].isin(compare_names)] if compare_names else area_metrics.nlargest(10, rate_metric)
-        fig_compare = px.bar(compare_df, x="name", y=rate_metric, color=rate_metric, color_continuous_scale="Blues")
-        st.plotly_chart(fig_compare, width="stretch")
-        st.dataframe(compare_df.sort_values(rate_metric, ascending=False), width="stretch")
-        corr = correlation_table(area_metrics)
-        if not corr.empty:
-            st.markdown("#### Demographic correlation explorer")
-            st.caption("Pearson correlations are descriptive, unadjusted, and not causal.")
-            with st.expander("How this correlation is calculated"):
-                st.markdown("Each observation is one neighborhood with matched, filtered notice activity. Pearson's r compares its total notice count with each numeric column. Missing pairs are omitted; the table reports the number of paired neighborhoods. At least three nonconstant pairs are required. Values range from −1 (opposite linear movement) to +1 (same-direction linear movement); 0 means no linear relationship. There is no legal or policy standard behind these scores, no significance test, no adjustment for multiple comparisons, and no control for population, rental stock, or other factors. Areas with no matched notices are absent from this comparison. Columns such as filing nodes and unique addresses overlap with the count itself and are not independent demographic explanations.")
-                st.latex(r"r=\frac{\sum_i(x_i-\bar{x})(y_i-\bar{y})}{\sqrt{\sum_i(x_i-\bar{x})^2\sum_i(y_i-\bar{y})^2}}")
-            st.dataframe(corr, width="stretch")
+            points = gpd.GeoDataFrame(
+                ev_filtered.copy(),
+                geometry=gpd.points_from_xy(ev_filtered["long"], ev_filtered["lat"]),
+                crs="EPSG:4326",
+            )
+            area_join = gpd.sjoin(points, nbhd[["name", "geometry"]], how="inner", predicate="within")
+            area_metrics = (
+                area_join.groupby("name", as_index=False)
+                .agg(evictions_total=("Eviction_Count", "sum"), filing_nodes=("full_address", "size"), unique_addresses=("full_address", "nunique"), rent_owed=("Total_Rent_Owed", "sum"))
+            )
+            if not census_df.empty:
+                area_metrics = area_metrics.merge(census_df, on="name", how="left")
+            denominators_file = st.file_uploader("Optional denominators CSV (`name`, `renter_households`)", type="csv", key="denominators")
+            if denominators_file is not None:
+                denominators = pd.read_csv(denominators_file)
+                if {"name", "renter_households"}.issubset(denominators.columns):
+                    area_metrics = area_metrics.merge(denominators[["name", "renter_households"]], on="name", how="left")
+                    area_metrics["notices_per_1000_renter_households"] = area_metrics["evictions_total"] / area_metrics["renter_households"] * 1000
+                    rate_metric = "notices_per_1000_renter_households"
+                else:
+                    st.error("Denominator file needs `name` and `renter_households`.")
+                    rate_metric = "evictions_total"
+            else:
+                rate_metric = "evictions_total"
+                st.info("Upload renter-household denominators to calculate comparable rates per 1,000. Raw counts are shown until then.")
+            compare_names = st.multiselect("Choose 2–6 neighborhoods", sorted(area_metrics["name"].unique()), max_selections=6)
+            compare_df = area_metrics[area_metrics["name"].isin(compare_names)] if compare_names else area_metrics.nlargest(10, rate_metric)
+            fig_compare = px.bar(compare_df, y="name", x=rate_metric, orientation="h",
+                                 labels={"name": "Neighborhood", rate_metric: "Notice records"})
+            readable_neighborhoods(fig_compare, rate=rate_metric != "evictions_total")
+            st.plotly_chart(fig_compare, width="stretch")
+            st.dataframe(compare_df.sort_values(rate_metric, ascending=False), width="stretch")
+            corr = correlation_table(area_metrics)
+            if not corr.empty:
+                st.markdown("#### Demographic correlation explorer")
+                st.caption("Pearson correlations are descriptive, unadjusted, and not causal.")
+                with st.expander("How this correlation is calculated"):
+                    st.markdown("Each observation is one neighborhood with matched, filtered notice activity. Pearson's r compares its total notice count with each numeric column. Missing pairs are omitted; the table reports the number of paired neighborhoods. At least three nonconstant pairs are required. Values range from −1 (opposite linear movement) to +1 (same-direction linear movement); 0 means no linear relationship. There is no legal or policy standard behind these scores, no significance test, no adjustment for multiple comparisons, and no control for population, rental stock, or other factors. Areas with no matched notices are absent from this comparison. Columns such as filing nodes and unique addresses overlap with the count itself and are not independent demographic explanations.")
+                    st.latex(r"r=\frac{\sum_i(x_i-\bar{x})(y_i-\bar{y})}{\sqrt{\sum_i(x_i-\bar{x})^2\sum_i(y_i-\bar{y})^2}}")
+                st.dataframe(corr, width="stretch")
 
 with tab_hotspots:
-    st.subheader("Descriptive grid hotspots")
-    precision = st.slider("Grid precision", 2, 3, 2, help="2 ≈ 1 km cells; 3 ≈ 100 m cells.")
-    hotspots = grid_hotspots(ev_filtered, precision=precision)
-    if not hotspots.empty:
-        st.caption("Hotspot z-scores compare grid-cell counts with all cells in the filtered view; they are not spatial-significance tests.")
-        fig_hot = px.scatter_map(
-            hotspots,
-            lat="grid_lat",
-            lon="grid_long",
-            size="affected_tenants",
-            color="hotspot_z",
-            hover_data=["unique_addresses", "filing_nodes", "total_rent_owed"],
-            color_continuous_scale="RdBu_r",
-            zoom=9,
-            height=520,
-        )
-        fig_hot.update_layout(map_style="carto-positron")
-        st.plotly_chart(fig_hot, width="stretch")
-        st.dataframe(hotspots.head(50), width="stretch")
+    if tab_hotspots.open:
+        st.subheader("Descriptive grid hotspots")
+        precision = st.slider("Grid precision", 2, 3, 2, help="2 ≈ 1 km cells; 3 ≈ 100 m cells.")
+        hotspots = grid_hotspots(ev_filtered, precision=precision)
+        if not hotspots.empty:
+            st.caption("Hotspot z-scores compare grid-cell counts with all cells in the filtered view; they are not spatial-significance tests.")
+            fig_hot = px.scatter_map(
+                hotspots,
+                lat="grid_lat",
+                lon="grid_long",
+                size="affected_tenants",
+                color="hotspot_z",
+                hover_data=["unique_addresses", "filing_nodes", "total_rent_owed"],
+                color_continuous_scale="RdBu_r",
+                zoom=9,
+                height=520,
+            )
+            fig_hot.update_layout(map_style="carto-positron")
+            st.plotly_chart(fig_hot, width="stretch")
+            st.dataframe(hotspots.head(50), width="stretch")
 
 with tab_alerts:
-    st.subheader("Trend anomalies and policy overlays")
-    window = st.slider("Baseline months", 2, 12, 3)
-    st.caption("Baseline = the mean of the previous selected number of calendar months, excluding the current month. A complete window is required. Alerts flag deviations of at least 2 sample standard deviations; this is a screening rule, not statistical proof or a policy standard. Gaps remain missing; incomplete or filtered months can distort comparisons.")
-    anomalies = anomaly_table(ev_filtered, window=window)
-    if not anomalies.empty:
-        fig_alert = px.line(anomalies, x="month", y=["evictions", "baseline"], markers=True)
-        flagged = anomalies[anomalies["is_alert"]]
-        if not flagged.empty:
-            fig_alert.add_scatter(x=flagged["month"], y=flagged["evictions"], mode="markers", marker={"size": 14, "color": "red"}, name="±2 SD alert")
-        policy_file = st.file_uploader("Optional policy timeline CSV (`date`, `label`)", type="csv", key="policy_timeline")
-        if policy_file is not None:
-            policy = pd.read_csv(policy_file)
-            if {"date", "label"}.issubset(policy.columns):
-                policy["date"] = pd.to_datetime(policy["date"], errors="coerce")
-                for event in policy.dropna(subset=["date"]).itertuples():
-                    fig_alert.add_vline(x=event.date.timestamp() * 1000, line_dash="dot", annotation_text=str(event.label)[:40])
-            else:
-                st.error("Policy timeline needs `date` and `label`.")
-        st.plotly_chart(fig_alert, width="stretch")
-        st.dataframe(anomalies.sort_values("z_score", key=abs, ascending=False).head(20), width="stretch")
-    search_definition = {
-        "area": selected_area,
-        "start_date": str(start_date),
-        "end_date": str(end_date),
-        "causes": selected_causes,
-        "districts": selected_districts,
-        "zips": selected_zips,
-        "zori_month": selected_zori_month,
-        "apn": apn_query,
-        "address": address_query,
-        "minimum_repeat_filings": repeat_min,
-    }
-    st.download_button("Save search / alert definition", json.dumps(search_definition, indent=2), "evictorbookla_saved_search.json", "application/json")
-    st.caption("Automated email/SMS delivery requires a scheduler and messaging backend; this export is ready for one.")
+    if tab_alerts.open:
+        st.subheader("Trend anomalies and policy overlays")
+        window = st.slider("Baseline months", 2, 12, 3)
+        st.caption("Baseline = the mean of the previous selected number of calendar months, excluding the current month. A complete window is required. Alerts flag deviations of at least 2 sample standard deviations; this is a screening rule, not statistical proof or a policy standard. Gaps remain missing; incomplete or filtered months can distort comparisons.")
+        anomalies = anomaly_table(ev_filtered, window=window)
+        if not anomalies.empty:
+            fig_alert = px.line(anomalies, x="month", y=["evictions", "baseline"], markers=True)
+            flagged = anomalies[anomalies["is_alert"]]
+            if not flagged.empty:
+                fig_alert.add_scatter(x=flagged["month"], y=flagged["evictions"], mode="markers", marker={"size": 14, "color": "red"}, name="±2 SD alert")
+            policy_file = st.file_uploader("Optional policy timeline CSV (`date`, `label`)", type="csv", key="policy_timeline")
+            if policy_file is not None:
+                policy = pd.read_csv(policy_file)
+                if {"date", "label"}.issubset(policy.columns):
+                    policy["date"] = pd.to_datetime(policy["date"], errors="coerce")
+                    for event in policy.dropna(subset=["date"]).itertuples():
+                        fig_alert.add_vline(x=event.date.timestamp() * 1000, line_dash="dot", annotation_text=str(event.label)[:40])
+                else:
+                    st.error("Policy timeline needs `date` and `label`.")
+            st.plotly_chart(fig_alert, width="stretch")
+            st.dataframe(anomalies.sort_values("z_score", key=abs, ascending=False).head(20), width="stretch")
+        search_definition = {
+            "area": selected_area,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "causes": selected_causes,
+            "districts": selected_districts,
+            "zips": selected_zips,
+            "zori_month": selected_zori_month,
+            "apn": apn_query,
+            "address": address_query,
+            "minimum_repeat_filings": repeat_min,
+        }
+        st.download_button("Save search / alert definition", json.dumps(search_definition, indent=2), "evictorbookla_saved_search.json", "application/json")
+        st.caption("Automated email/SMS delivery requires a scheduler and messaging backend; this export is ready for one.")
 
 with tab_forecast:
-    st.subheader("Short-term filing forecast")
-    horizon = st.slider("Forecast months", 3, 18, 6)
-    forecast, diagnostics = forecast_monthly(ev_filtered, months=horizon)
-    if forecast.empty:
-        st.info(diagnostics.get("method", "At least four months of history are required."))
-    else:
-        historic = anomaly_table(ev_filtered)[["month", "evictions"]]
-        fig_forecast = go.Figure()
-        fig_forecast.add_scatter(x=historic["month"], y=historic["evictions"], mode="lines+markers", name="Observed")
-        fig_forecast.add_scatter(x=forecast["month"], y=forecast["upper"], mode="lines", line={"width": 0}, showlegend=False)
-        fig_forecast.add_scatter(x=forecast["month"], y=forecast["lower"], mode="lines", fill="tonexty", fillcolor="rgba(59,111,182,0.12)", line={"width": 0}, name="95% prediction interval (future count)")
-        fig_forecast.add_scatter(x=forecast["month"], y=forecast["ci_upper_95"], mode="lines", line={"width": 0}, showlegend=False)
-        fig_forecast.add_scatter(x=forecast["month"], y=forecast["ci_lower_95"], mode="lines", fill="tonexty", fillcolor="rgba(59,111,182,0.30)", line={"width": 0}, name="95% confidence interval (mean count)")
-        fig_forecast.add_scatter(x=forecast["month"], y=forecast["forecast"], mode="lines+markers", name="Linear baseline",
-                                customdata=forecast[["ci_lower_95", "ci_upper_95", "lower", "upper"]],
-                                hovertemplate="%{x|%b %Y}<br>Forecast: %{y:,.0f}<br>95% mean CI: %{customdata[0]:,.0f}–%{customdata[1]:,.0f}<br>95% prediction interval: %{customdata[2]:,.0f}–%{customdata[3]:,.0f}<extra></extra>")
-        st.plotly_chart(fig_forecast, width="stretch")
-        st.metric("Holdout mean absolute error", f"{diagnostics['mae']:.1f} notices")
-        st.warning("This is a transparent planning baseline, not a causal forecast. Sudden policy or reporting changes are not modeled.")
-        st.caption("The darker 95% confidence band estimates the mean monthly count; the wider 95% prediction band allows for variation in a future monthly count. Both use OLS residual variance, forecast leverage, and a Student-t critical value with n−2 degrees of freedom. They assume a correct linear trend and independent, normally distributed errors with constant variance. Serial correlation, seasonality, incomplete months, reporting delays and policy changes can invalidate coverage. Negative values are truncated at zero; nominal 95% coverage has not been independently validated.")
-        with st.expander("Monthly forecasts and intervals"):
-            displayed_forecast = forecast.rename(columns={"forecast":"Forecast notices", "ci_lower_95":"95% mean CI lower", "ci_upper_95":"95% mean CI upper", "lower":"95% prediction lower", "upper":"95% prediction upper"})
-            st.dataframe(displayed_forecast, hide_index=True, width="stretch")
-            exported_forecast = displayed_forecast.assign(confidence_level=.95, interval_method="OLS Student-t, iid normal errors; count bounds truncated at zero")
-            st.download_button("Download monthly forecasts with intervals", exported_forecast.to_csv(index=False), "monthly_notice_forecasts.csv", "text/csv")
+    if tab_forecast.open:
+        st.subheader("Short-term filing forecast")
+        horizon = st.slider("Forecast months", 3, 18, 6)
+        forecast, diagnostics = forecast_monthly(ev_filtered, months=horizon)
+        if forecast.empty:
+            st.info(diagnostics.get("method", "At least four months of history are required."))
+        else:
+            historic = anomaly_table(ev_filtered)[["month", "evictions"]]
+            fig_forecast = go.Figure()
+            fig_forecast.add_scatter(x=historic["month"], y=historic["evictions"], mode="lines+markers", name="Observed")
+            fig_forecast.add_scatter(x=forecast["month"], y=forecast["upper"], mode="lines", line={"width": 0}, showlegend=False)
+            fig_forecast.add_scatter(x=forecast["month"], y=forecast["lower"], mode="lines", fill="tonexty", fillcolor="rgba(59,111,182,0.12)", line={"width": 0}, name="95% prediction interval (future count)")
+            fig_forecast.add_scatter(x=forecast["month"], y=forecast["ci_upper_95"], mode="lines", line={"width": 0}, showlegend=False)
+            fig_forecast.add_scatter(x=forecast["month"], y=forecast["ci_lower_95"], mode="lines", fill="tonexty", fillcolor="rgba(59,111,182,0.30)", line={"width": 0}, name="95% confidence interval (mean count)")
+            fig_forecast.add_scatter(x=forecast["month"], y=forecast["forecast"], mode="lines+markers", name="Linear baseline",
+                                    customdata=forecast[["ci_lower_95", "ci_upper_95", "lower", "upper"]],
+                                    hovertemplate="%{x|%b %Y}<br>Forecast: %{y:,.0f}<br>95% mean CI: %{customdata[0]:,.0f}–%{customdata[1]:,.0f}<br>95% prediction interval: %{customdata[2]:,.0f}–%{customdata[3]:,.0f}<extra></extra>")
+            st.plotly_chart(fig_forecast, width="stretch")
+            st.metric("Holdout mean absolute error", f"{diagnostics['mae']:.1f} notices")
+            st.warning("This is a transparent planning baseline, not a causal forecast. Sudden policy or reporting changes are not modeled.")
+            st.caption("The darker 95% confidence band estimates the mean monthly count; the wider 95% prediction band allows for variation in a future monthly count. Both use OLS residual variance, forecast leverage, and a Student-t critical value with n−2 degrees of freedom. They assume a correct linear trend and independent, normally distributed errors with constant variance. Serial correlation, seasonality, incomplete months, reporting delays and policy changes can invalidate coverage. Negative values are truncated at zero; nominal 95% coverage has not been independently validated.")
+            with st.expander("Monthly forecasts and intervals"):
+                displayed_forecast = forecast.rename(columns={"forecast":"Forecast notices", "ci_lower_95":"95% mean CI lower", "ci_upper_95":"95% mean CI upper", "lower":"95% prediction lower", "upper":"95% prediction upper"})
+                st.dataframe(displayed_forecast, hide_index=True, width="stretch")
+                exported_forecast = displayed_forecast.assign(confidence_level=.95, interval_method="OLS Student-t, iid normal errors; count bounds truncated at zero")
+                st.download_button("Download monthly forecasts with intervals", exported_forecast.to_csv(index=False), "monthly_notice_forecasts.csv", "text/csv")
 
 with tab_reports:
-    st.subheader("Share, export, and print")
-    report_bytes = report_html(ev_filtered, selected_area, f"{start_date} to {end_date}")
-    col_a, col_b, col_c = st.columns(3)
-    col_a.download_button("Printable report (HTML/PDF)", report_bytes, "evictorbookla_report.html", "text/html")
-    col_b.download_button("Filtered GeoJSON", selection_geojson(ev_filtered), "evictorbookla_filtered.geojson", "application/geo+json")
-    col_c.download_button("Filtered CSV", ev_filtered.to_csv(index=False), "evictorbookla_filtered.csv", "text/csv")
-    share_state = json.dumps(search_definition)
-    components.html(
-        f"""<button id='copy-view' style='padding:8px 12px'>Copy shareable view URL</button>
-        <span id='copy-status' aria-live='polite'></span><script>
-        document.getElementById('copy-view').onclick = async () => {{
-          const url = new URL(window.parent.location.href);
-          url.searchParams.set('view', btoa(unescape(encodeURIComponent(JSON.stringify({share_state})))));
-          await navigator.clipboard.writeText(url.toString());
-          document.getElementById('copy-status').textContent = ' Copied';
-        }};</script>""",
-        height=45,
-    )
-    st.caption("The URL stores the current filter definition. Polygon IDs remain in the existing `sel` parameter.")
-    st.markdown("#### Embed")
-    st.code('<iframe src="YOUR_DEPLOYED_APP_URL/?embed=true" width="100%" height="900" loading="lazy" title="EvictorBookLA Atlas map"></iframe>', language="html")
+    if tab_reports.open:
+        st.subheader("Share, export, and print")
+        report_bytes = report_html(ev_filtered, selected_area, f"{start_date} to {end_date}")
+        col_a, col_b, col_c = st.columns(3)
+        col_a.download_button("Printable report (HTML/PDF)", report_bytes, "evictorbookla_report.html", "text/html")
+        col_b.download_button("Filtered GeoJSON", selection_geojson(ev_filtered), "evictorbookla_filtered.geojson", "application/geo+json")
+        col_c.download_button("Filtered CSV", ev_filtered.to_csv(index=False), "evictorbookla_filtered.csv", "text/csv")
+        share_state = json.dumps(search_definition)
+        embed_html(
+            f"""<button id='copy-view' style='padding:8px 12px'>Copy shareable view URL</button>
+            <span id='copy-status' aria-live='polite'></span><script>
+            document.getElementById('copy-view').onclick = async () => {{
+              const url = new URL(window.parent.location.href);
+              url.searchParams.set('view', btoa(unescape(encodeURIComponent(JSON.stringify({share_state})))));
+              await navigator.clipboard.writeText(url.toString());
+              document.getElementById('copy-status').textContent = ' Copied';
+            }};</script>""",
+            height=45,
+        )
+        st.caption("The URL stores the current filter definition. Polygon IDs remain in the existing `sel` parameter.")
+        st.markdown("#### Embed")
+        st.code('<iframe src="YOUR_DEPLOYED_APP_URL/?embed=true" width="100%" height="900" loading="lazy" title="EvictorBookLA Atlas map"></iframe>', language="html")
 
 with tab_method:
-    try:
-        st.page_link("math_page.py", label="All ALPHA and BETA mathematical methods", icon="📐")
-    except st.errors.StreamlitAPIException:
-        # The original app.py entry point has no multipage navigation registry.
-        # Keep the complete reference accessible when ALPHA runs standalone.
-        with st.expander("All ALPHA and BETA mathematical methods"):
-            from methods_ui import render_mathematical_methods
-            render_mathematical_methods()
-    st.subheader("Definitions, provenance, limitations, and tenant resources")
-    with st.expander("Full metric guide and data dictionary"):
-        guide = Path(__file__).with_name("ANALYTICS_GUIDE.md")
-        if guide.exists():
-            st.markdown(guide.read_text())
-    coverage_start = evictions["Date_Filed"].min().date()
-    coverage_end = evictions["Date_Filed"].max().date()
-    source_rows = len(pd.read_csv(EVICTION_CSV, usecols=["row_id"]))
-    zori_coverage = (
-        f"{pd.to_datetime(zori_month_columns[0]).strftime('%B %Y')} to "
-        f"{pd.to_datetime(zori_month_columns[-1]).strftime('%B %Y')}"
-        if zori_month_columns
-        else "Unavailable"
-    )
-    quality = pd.DataFrame(
-        {
-            "Item": [
-                "Eviction source",
-                "Eviction coverage",
-                "Raw eviction rows",
-                "Mapped address-date nodes",
-                "Missing coordinates after cleaning",
-                "Eviction file update",
-                "Asking-rent source",
-                "ZORI coverage",
-                "ZIP overlay geometry",
-            ],
-            "Value": [
-                "Los Angeles Housing Department eviction notices",
-                f"{coverage_start} to {coverage_end}",
-                f"{source_rows:,}",
-                f"{len(evictions):,}",
-                "Excluded from mapped analysis",
-                pd.Timestamp(os.path.getmtime(EVICTION_CSV), unit="s").strftime("%Y-%m-%d %H:%M"),
-                "Zillow Observed Rent Index (ZIP-level, smoothed)",
-                zori_coverage,
-                "U.S. Census Bureau 2020 generalized ZCTAs",
-            ],
-        }
-    )
-    st.dataframe(quality, hide_index=True, width="stretch")
-    with st.expander("Monthly source coverage — including unmapped notices", expanded=True):
-        coverage_raw = pd.read_csv(EVICTION_CSV, usecols=["Date Received", "lat", "long"])
-        coverage_raw["month"] = pd.to_datetime(coverage_raw["Date Received"], format="mixed", errors="coerce").dt.to_period("M").dt.to_timestamp()
-        coverage_raw["mapped"] = coverage_raw[["lat", "long"]].notna().all(axis=1)
-        coverage = coverage_raw.groupby("month").agg(source_notices=("mapped", "size"), mapped_notices=("mapped", "sum"))
-        if not coverage.empty:
-            coverage = coverage.reindex(pd.date_range(coverage.index.min(), coverage.index.max(), freq="MS")).rename_axis("month").reset_index()
-            coverage["unmapped_notices"] = coverage["source_notices"] - coverage["mapped_notices"]
-            coverage["mapped_percent"] = 100 * coverage["mapped_notices"] / coverage["source_notices"]
-            st.plotly_chart(px.line(coverage, x="month", y=["source_notices", "mapped_notices"], markers=True), width="stretch")
-            st.dataframe(coverage, hide_index=True, width="stretch")
-            st.download_button("Download monthly coverage", coverage.to_csv(index=False), "lahd_monthly_coverage.csv", "text/csv")
-        st.caption("All locally imported LAHD notices by Date Received, independent of map filters. Missing coordinates reduce mapped counts; they do not remove records from this source-coverage view. An absent month is shown as missing, never invented or interpolated. The latest month may be incomplete.")
-    if METADATA_PATH.exists():
-        refresh_meta = json.loads(METADATA_PATH.read_text())
-        st.markdown("#### Live-source status")
-        status_cols = st.columns(4)
-        status_cols[0].metric("Last checked", pd.to_datetime(refresh_meta.get("checked_at") or refresh_meta["refreshed_at"]).strftime("%Y-%m-%d %H:%M UTC"))
-        status_cols[1].metric("Latest notice received", refresh_meta["checks"]["latest_received"])
-        status_cols[2].metric("Source rows", f"{refresh_meta['checks']['rows']:,}")
-        status_cols[3].metric("Mapped rows", f"{refresh_meta['checks']['mapped_percent']:.1f}%")
-        st.caption(f"Published file timestamp: {refresh_meta['source_csv'].get('last_modified') or 'not supplied'}")
-    st.markdown(
-        """
-        **Core definitions.** A filing node is one address-date combination. `Date_Filed` is LAHD's Date Received. `Eviction_Count` and legacy “Affected tenants” fields count notice records, not people or completed evictions. `Total_Rent_Owed` sums reported amounts within a node; these amounts are not independently verified. Repeat filing counts are filing dates per address. APN identifies a parcel, not a verified owner. Zillow ZORI estimates typical market asking rent for a ZIP area; it is not a tenant's contract rent.
+    if tab_method.open:
+        try:
+            st.page_link("math_page.py", label="All ALPHA and BETA mathematical methods", icon="📐")
+        except st.errors.StreamlitAPIException:
+            # The original app.py entry point has no multipage navigation registry.
+            # Keep the complete reference accessible when ALPHA runs standalone.
+            with st.expander("All ALPHA and BETA mathematical methods"):
+                from methods_ui import render_mathematical_methods
+                render_mathematical_methods()
+        st.subheader("Definitions, provenance, limitations, and tenant resources")
+        with st.expander("Full metric guide and data dictionary"):
+            guide = Path(__file__).with_name("ANALYTICS_GUIDE.md")
+            if guide.exists():
+                st.markdown(guide.read_text())
+        coverage_start = evictions["Date_Filed"].min().date()
+        coverage_end = evictions["Date_Filed"].max().date()
+        source_rows = len(pd.read_csv(EVICTION_CSV, usecols=["row_id"]))
+        zori_coverage = (
+            f"{pd.to_datetime(zori_month_columns[0]).strftime('%B %Y')} to "
+            f"{pd.to_datetime(zori_month_columns[-1]).strftime('%B %Y')}"
+            if zori_month_columns
+            else "Unavailable"
+        )
+        quality = pd.DataFrame(
+            {
+                "Item": [
+                    "Eviction source",
+                    "Eviction coverage",
+                    "Raw eviction rows",
+                    "Mapped address-date nodes",
+                    "Missing coordinates after cleaning",
+                    "Eviction file update",
+                    "Asking-rent source",
+                    "ZORI coverage",
+                    "ZIP overlay geometry",
+                ],
+                "Value": [
+                    "Los Angeles Housing Department eviction notices",
+                    f"{coverage_start} to {coverage_end}",
+                    f"{source_rows:,}",
+                    f"{len(evictions):,}",
+                    "Excluded from mapped analysis",
+                    pd.Timestamp(os.path.getmtime(EVICTION_CSV), unit="s").strftime("%Y-%m-%d %H:%M"),
+                    "Zillow Observed Rent Index (ZIP-level, smoothed)",
+                    zori_coverage,
+                    "U.S. Census Bureau 2020 generalized ZCTAs",
+                ],
+            }
+        )
+        st.dataframe(quality, hide_index=True, width="stretch")
+        with st.expander("Monthly source coverage — including unmapped notices", expanded=True):
+            coverage_raw = pd.read_csv(EVICTION_CSV, usecols=["Date Received", "lat", "long"])
+            coverage_raw["month"] = pd.to_datetime(coverage_raw["Date Received"], format="mixed", errors="coerce").dt.to_period("M").dt.to_timestamp()
+            coverage_raw["mapped"] = coverage_raw[["lat", "long"]].notna().all(axis=1)
+            coverage = coverage_raw.groupby("month").agg(source_notices=("mapped", "size"), mapped_notices=("mapped", "sum"))
+            if not coverage.empty:
+                coverage = coverage.reindex(pd.date_range(coverage.index.min(), coverage.index.max(), freq="MS")).rename_axis("month").reset_index()
+                coverage["unmapped_notices"] = coverage["source_notices"] - coverage["mapped_notices"]
+                coverage["mapped_percent"] = 100 * coverage["mapped_notices"] / coverage["source_notices"]
+                st.plotly_chart(px.line(coverage, x="month", y=["source_notices", "mapped_notices"], markers=True), width="stretch")
+                st.dataframe(coverage, hide_index=True, width="stretch")
+                st.download_button("Download monthly coverage", coverage.to_csv(index=False), "lahd_monthly_coverage.csv", "text/csv")
+            st.caption("All locally imported LAHD notices by Date Received, independent of map filters. Missing coordinates reduce mapped counts; they do not remove records from this source-coverage view. An absent month is shown as missing, never invented or interpolated. The latest month may be incomplete.")
+        if METADATA_PATH.exists():
+            refresh_meta = json.loads(METADATA_PATH.read_text())
+            st.markdown("#### Live-source status")
+            status_cols = st.columns(4)
+            status_cols[0].metric("Last checked", pd.to_datetime(refresh_meta.get("checked_at") or refresh_meta["refreshed_at"]).strftime("%Y-%m-%d %H:%M UTC"))
+            status_cols[1].metric("Latest notice received", refresh_meta["checks"]["latest_received"])
+            status_cols[2].metric("Source rows", f"{refresh_meta['checks']['rows']:,}")
+            status_cols[3].metric("Mapped rows", f"{refresh_meta['checks']['mapped_percent']:.1f}%")
+            st.caption(f"Published file timestamp: {refresh_meta['source_csv'].get('last_modified') or 'not supplied'}")
+        st.markdown(
+            """
+            **Core definitions.** A filing node is one address-date combination. `Date_Filed` is LAHD's Date Received. `Eviction_Count` and legacy “Affected tenants” fields count notice records, not people or completed evictions. `Total_Rent_Owed` sums reported amounts within a node; these amounts are not independently verified. Repeat filing counts are filing dates per address. APN identifies a parcel, not a verified owner. Zillow ZORI estimates typical market asking rent for a ZIP area; it is not a tenant's contract rent.
 
-        **Rent comparison math.** For month *t*, average asking rent is the arithmetic mean of available ZORI values across ZIP codes represented by the active eviction filters: `mean(ZORI_zip,t)`. Average rent owed is the arithmetic mean of positive LAHD `Rent Owed` values on matched notice records filed in month *t*. Missing Zillow ZIP-month observations remain missing and are not converted to zero. The ZORI aggregation is unweighted because the supplied file does not include rental-stock weights.
+            **Rent comparison math.** For month *t*, average asking rent is the arithmetic mean of available ZORI values across ZIP codes represented by the active eviction filters: `mean(ZORI_zip,t)`. Average rent owed is the arithmetic mean of positive LAHD `Rent Owed` values on matched notice records filed in month *t*. Missing Zillow ZIP-month observations remain missing and are not converted to zero. The ZORI aggregation is unweighted because the supplied file does not include rental-stock weights.
 
-        **Monthly forecast uncertainty.** Ordinary least squares fits notice count to month index. For n months, residual variance is `s² = SSE / (n−2)` and future leverage is `h = 1/n + (x−mean(x))² / sum((x−mean(x))²)`. The pointwise 95% confidence interval for the mean is `forecast ± t(.975,n−2) × sqrt(s²h)`; the wider 95% prediction interval for a future count is `forecast ± t(.975,n−2) × sqrt(s²(1+h))`. Bounds are truncated at zero. Coverage assumes independent, normal, constant-variance errors and an adequate linear trend; real-world 95% coverage has not been verified. See BETA's Methods for separate address-probability intervals.
+            **Monthly forecast uncertainty.** Ordinary least squares fits notice count to month index. For n months, residual variance is `s² = SSE / (n−2)` and future leverage is `h = 1/n + (x−mean(x))² / sum((x−mean(x))²)`. The pointwise 95% confidence interval for the mean is `forecast ± t(.975,n−2) × sqrt(s²h)`; the wider 95% prediction interval for a future count is `forecast ± t(.975,n−2) × sqrt(s²(1+h))`. Bounds are truncated at zero. Coverage assumes independent, normal, constant-variance errors and an adequate linear trend; real-world 95% coverage has not been verified. See BETA's Methods for separate address-probability intervals.
 
-        **Map method.** The asking-rent overlay joins the selected ZORI month to 2020 Census ZIP Code Tabulation Area (ZCTA) polygons by five-digit code. The color scale uses the 10th to 90th percentile of visible ZIP values so high-rent outliers do not flatten the rest of the map; hover details retain the exact value. ZCTAs approximate ZIP service areas and are not USPS delivery-route boundaries.
+            **Map method.** The asking-rent overlay joins the selected ZORI month to 2020 Census ZIP Code Tabulation Area (ZCTA) polygons by five-digit code. The color scale uses the 10th to 90th percentile of visible ZIP values so high-rent outliers do not flatten the rest of the map; hover details retain the exact value. ZCTAs approximate ZIP service areas and are not USPS delivery-route boundaries.
 
-        **Important limitations.** Notices are not court judgments or proof that a household physically moved. Address geocoding, duplicate records, missing notices, boundary assignment, and changing reporting practices can affect results. Owner analysis requires an external verified APN crosswalk. Neighborhood rates require renter-household denominators.
+            **Important limitations.** Notices are not court judgments or proof that a household physically moved. Address geocoding, duplicate records, missing notices, boundary assignment, and changing reporting practices can affect results. Owner analysis requires an external verified APN crosswalk. Neighborhood rates require renter-household denominators.
 
-        **Data sources.** [Zillow Research ZORI data](https://www.zillow.com/research/data/) · [Census ZCTA definitions](https://www.census.gov/programs-surveys/geography/guidance/geo-areas/zctas.html) · [Census TIGERweb boundary service](https://tigerweb.geo.census.gov/arcgis/rest/services/Generalized_TAB2020/PUMA_TAD_TAZ_UGA_ZCTA/MapServer/3)
+            **Data sources.** [Zillow Research ZORI data](https://www.zillow.com/research/data/) · [Census ZCTA definitions](https://www.census.gov/programs-surveys/geography/guidance/geo-areas/zctas.html) · [Census TIGERweb boundary service](https://tigerweb.geo.census.gov/arcgis/rest/services/Generalized_TAB2020/PUMA_TAD_TAZ_UGA_ZCTA/MapServer/3)
 
-        **Tenant resources.** [LAHD renter resources](https://housing.lacity.gov/residents/renters) · [Stay Housed LA](https://www.stayhousedla.org/) · [211 LA](https://211la.org/)
-        """
-    )
+            **Tenant resources.** [LAHD renter resources](https://housing.lacity.gov/residents/renters) · [Stay Housed LA](https://www.stayhousedla.org/) · [211 LA](https://211la.org/)
+            """
+        )
 
 with tab_admin:
-    st.subheader("LAHD live-data refresh")
-    st.markdown(f"Source: [LAHD published eviction CSV]({SOURCE_CSV})")
-    st.caption("While this dashboard is open, an hourly timer checks whether the 24-hour refresh interval has elapsed. CSV and Excel source files are accepted. Closing the app stops these checks. Set `LAHD_AUTO_REFRESH_HOURS=0` to disable or another number to change the interval.")
-    refresh_cols = st.columns(2)
-    if refresh_cols[0].button("Check source now", type="secondary"):
-        try:
-            with st.spinner("Downloading and validating LAHD data…"):
-                check_result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=True, geocode=False)
-            if check_result.get("status") == "retained_newer_local_data":
-                st.info(check_result["message"])
-            else:
-                st.success("Source passed validation; no local files were changed.")
-            st.json(check_result)
-        except Exception as error:
-            st.error(f"Source check failed; saved data retained. {error}")
-    if refresh_cols[1].button("Update from LAHD now", type="primary"):
-        try:
-            with st.spinner("Updating from LAHD and preserving a rollback copy…"):
-                update_result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=False, geocode=False)
-            st.cache_data.clear()
-            if update_result.get("status") == "retained_newer_local_data":
-                st.info(update_result["message"])
-            else:
-                st.success(f"Updated to {update_result['checks']['latest_received']} with {update_result['checks']['rows']:,} rows.")
-            st.rerun()
-        except Exception as error:
-            st.error(f"Refresh failed; saved data retained. {error}")
-    st.info("The direct LAHD CSV does not include coordinates. Existing address/APN coordinates and the geocode cache are reused; unmatched records remain in the source file but are excluded from map-only analysis.")
+    if tab_admin.open:
+        st.subheader("LAHD live-data refresh")
+        st.markdown(f"Source: [LAHD published eviction CSV]({SOURCE_CSV})")
+        st.caption("While this dashboard is open, an hourly timer checks whether the 24-hour refresh interval has elapsed. CSV and Excel source files are accepted. Closing the app stops these checks. Set `LAHD_AUTO_REFRESH_HOURS=0` to disable or another number to change the interval.")
+        refresh_cols = st.columns(2)
+        if refresh_cols[0].button("Check source now", type="secondary"):
+            try:
+                with st.spinner("Downloading and validating LAHD data…"):
+                    check_result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=True, geocode=False)
+                if check_result.get("status") == "retained_newer_local_data":
+                    st.info(check_result["message"])
+                else:
+                    st.success("Source passed validation; no local files were changed.")
+                st.json(check_result)
+            except Exception as error:
+                st.error(f"Source check failed; saved data retained. {error}")
+        if refresh_cols[1].button("Update from LAHD now", type="primary"):
+            try:
+                with st.spinner("Updating from LAHD and preserving a rollback copy…"):
+                    update_result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=False, geocode=False)
+                st.cache_data.clear()
+                if update_result.get("status") == "retained_newer_local_data":
+                    st.info(update_result["message"])
+                else:
+                    st.success(f"Updated to {update_result['checks']['latest_received']} with {update_result['checks']['rows']:,} rows.")
+                st.rerun()
+            except Exception as error:
+                st.error(f"Refresh failed; saved data retained. {error}")
+        st.info("The direct LAHD CSV does not include coordinates. Existing address/APN coordinates and the geocode cache are reused; unmatched records remain in the source file but are excluded from map-only analysis.")
 
-    st.markdown("#### Validate a manually downloaded dataset")
-    upload = st.file_uploader("Upload CSV for validation", type="csv", key="data_refresh")
-    if upload is not None:
-        candidate = pd.read_csv(upload)
-        required = {"full_address", "lat", "long", "Date Received", "Cause", "Apn", "Council District", "Rent Owed"}
-        missing = sorted(required - set(candidate.columns))
-        checks = {
-            "Rows": len(candidate),
-            "Columns": len(candidate.columns),
-            "Missing required columns": ", ".join(missing) or "None",
-            "Missing coordinates": int(candidate[["lat", "long"]].isna().any(axis=1).sum()) if {"lat", "long"}.issubset(candidate.columns) else "N/A",
-            "Duplicate rows": int(candidate.duplicated().sum()),
-        }
-        st.json(checks)
-        if not missing:
-            st.success("Schema validation passed. Review the preview before replacing the production file.")
-            st.dataframe(candidate.head(100), width="stretch")
-        else:
-            st.error("Schema validation failed; the production file was not changed.")
+        st.markdown("#### Validate a manually downloaded dataset")
+        upload = st.file_uploader("Upload CSV for validation", type="csv", key="data_refresh")
+        if upload is not None:
+            candidate = pd.read_csv(upload)
+            required = {"full_address", "lat", "long", "Date Received", "Cause", "Apn", "Council District", "Rent Owed"}
+            missing = sorted(required - set(candidate.columns))
+            checks = {
+                "Rows": len(candidate),
+                "Columns": len(candidate.columns),
+                "Missing required columns": ", ".join(missing) or "None",
+                "Missing coordinates": int(candidate[["lat", "long"]].isna().any(axis=1).sum()) if {"lat", "long"}.issubset(candidate.columns) else "N/A",
+                "Duplicate rows": int(candidate.duplicated().sum()),
+            }
+            st.json(checks)
+            if not missing:
+                st.success("Schema validation passed. Review the preview before replacing the production file.")
+                st.dataframe(candidate.head(100), width="stretch")
+            else:
+                st.error("Schema validation failed; the production file was not changed.")

@@ -53,6 +53,12 @@ The map requires `MAPBOX_TOKEN`. FRED uses the national rent-of-primary-residenc
 
 ## Live LAHD data refresh
 
+Startup uses the saved local dataset immediately. The first automatic LAHD check is deferred for one hour, so a slow external download does not block the initial page. Manual refresh remains in Data admin. The optional FRED download is enabled separately in the sidebar.
+
+## Loading performance
+
+Notice aggregates, notice-level rent records, Zillow data and ZIP boundaries use bounded disk caches keyed by their source file's modification time. Tabs render their contents only when selected. Subdivision-minus-neighborhood geometry is calculated only for the corresponding area filter. These changes reduce runtime work, not dependency installation; Community Cloud may discard disk caches during rebuilding or reprovisioning. A cold deployment still needs to populate them.
+
 While the app is open, an hourly timer checks whether the default 24-hour refresh interval has elapsed. The importer detects CSV or XLSX content (LAHD's .csv URL now sometimes returns an Excel workbook) and validates schema, dates, row counts, coordinate coverage, and historical-month retention before replacement. The prior validated file is retained as `data/cleaned_evictions_final.previous.csv` for rollback, and source timestamps plus QA results are recorded in `data/refresh_metadata.json`. File modification times invalidate the dashboard's cached data. Closing the app stops the timer.
 
 Run the refresh independently with:

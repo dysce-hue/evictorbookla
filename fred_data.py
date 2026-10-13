@@ -19,7 +19,7 @@ def fetch_rent_cpi(api_key="", session=None):
                 "https://api.stlouisfed.org/fred/series/observations",
                 params={"series_id": RENT_SERIES, "api_key": api_key.strip(),
                         "file_type": "json", "observation_start": "2015-01-01"},
-                timeout=30,
+                timeout=8,
             )
             response.raise_for_status()
             frame = pd.DataFrame(response.json()["observations"])[["date", "value"]]
@@ -30,7 +30,7 @@ def fetch_rent_cpi(api_key="", session=None):
             notes.append("FRED API unavailable or key rejected; trying the public CSV.")
     try:
         response = session.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
-                               params={"id": RENT_SERIES, "cosd": "2015-01-01"}, timeout=45)
+                               params={"id": RENT_SERIES, "cosd": "2015-01-01"}, timeout=8)
         response.raise_for_status()
         frame = pd.read_csv(io.StringIO(response.text))
         frame = frame.rename(columns={frame.columns[0]: "date", RENT_SERIES: "value"})
