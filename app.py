@@ -1,5 +1,8 @@
 import os
 import json
+import base64
+import copy
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -7,13 +10,41 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import plotly.express as px
+import plotly.graph_objects as go
+from fred_data import fetch_rent_cpi, RENT_SERIES
+
+from feature_engineering import (
+    address_profiles,
+    anomaly_table,
+    correlation_table,
+    forecast_monthly,
+    grid_hotspots,
+    property_profiles,
+    report_html,
+    routine_filer_summary,
+    selection_geojson,
+)
+from data_refresh import METADATA_PATH, SOURCE_CSV, refresh as refresh_lahd_data
 
 # ==============================
 # CONFIG
 # ==============================
-MAPBOX_TOKEN = "pk.eyJ1IjoiZHlsYW5nMjEzIiwiYSI6ImNtYnR1dXY5bTA3ZTcybXExbjYzYWRndHEifQ.ZCO0qTR3GITmJYJn0glaxg"
+def get_config_value(name):
+    """Read configuration from Streamlit secrets, then the environment."""
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        # Streamlit raises when no secrets file exists; environment variables
+        # remain available for local and non-Streamlit deployments.
+        value = None
+    return value or os.getenv(name, "")
+
+
+MAPBOX_TOKEN = get_config_value("MAPBOX_TOKEN")
 DATA_DIR = "data"
 EVICTION_CSV = os.path.join(DATA_DIR, "cleaned_evictions_final.csv")
+ZORI_ZIP_CSV = os.path.join(DATA_DIR, "zillow_zori_la_zip_monthly.csv")
+ZCTA_GEOJSON = os.path.join(DATA_DIR, "la_zcta_2020.geojson")
 
 # Shapefiles (same as Shiny)
 SUBDIV_SHP = os.path.join(DATA_DIR, "County_Subdivisions.shp")
@@ -23,19 +54,71 @@ NBHD_SHP = os.path.join(DATA_DIR, "8494cd42-db48-4af1-a215-a2c8f61e96a22020328-1
 NEIGHBORHOOD_CENSUS_CSV = os.path.join(DATA_DIR, "neighborhood_census.csv")
 
 # FRED CPI config 
-FRED_API_KEY = "e96136ab46ba35fca84c640ca9873d86"
-FRED_SERIES_ID = "CUSR0000SA0L2"  # rent of primary residence
+FRED_API_KEY = get_config_value("FRED_API_KEY")
+FRED_SERIES_ID = RENT_SERIES  # US city average rent of primary residence
+
+CAUSE_CATEGORY_ORDER = [
+    "Non-payment of rent",
+    "Lease violation",
+    "Nuisance / disturbance",
+    "Owner/family occupancy",
+    "Withdrawal / demolition",
+    "Multiple stated causes",
+    "Other single cause",
+    "Unknown / not specified",
+]
+
+
+def normalize_zip(values):
+    """Return five-digit ZIP labels while preserving missing values as blanks."""
+    normalized = values.fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    return normalized.where(normalized.str.fullmatch(r"\d{5}"), "")
+
+
+def split_cause_terms(value):
+    """Return unique LAHD cause terms without repeated combination wording."""
+    if not isinstance(value, str):
+        return []
+    terms = []
+    for part in value.split(","):
+        term = " ".join(part.split()).strip()
+        if term and term.lower() not in {"nan", "none"} and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def cause_category(value):
+    """Map each address-date node to one mutually exclusive chart category."""
+    terms = split_cause_terms(value)
+    meaningful = [term for term in terms if term.lower() != "unknown"]
+    if not meaningful:
+        return "Unknown / not specified"
+    if len(meaningful) > 1:
+        return "Multiple stated causes"
+
+    term = meaningful[0].lower()
+    if "non-payment of rent" in term:
+        return "Non-payment of rent"
+    if "violation of the rental agreement" in term:
+        return "Lease violation"
+    if "disorderly behavior" in term or "nuisance" in term:
+        return "Nuisance / disturbance"
+    if "owner/family occupancy" in term:
+        return "Owner/family occupancy"
+    if "withdrawing units" in term or "demolition" in term:
+        return "Withdrawal / demolition"
+    return "Other single cause"
 
 # ==============================
 # DATA LOADING — EVICTIONS
 # ==============================
 @st.cache_data
-def load_evictions(path):
+def load_evictions(path, modified_at=None):
     if not os.path.exists(path):
         st.error(f"Eviction CSV not found at: {path}")
         return pd.DataFrame()
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, dtype={"Zip": str, "Apn": str}, low_memory=False)
 
     expected_cols = [
         "Council District", "Rent Owed", "Date Received",
@@ -47,10 +130,25 @@ def load_evictions(path):
 
     df = df.copy()
 
+    # Preserve optional source fields so advanced filters appear automatically
+    # when refreshed datasets contain them.
+    for col in ["Zip", "Bedroom", "Notice Type", "Eviction Category", "Owner", "Owner Name", "Unit Count"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
     # Coerce stringish columns & handle NAs
     for col in ["Council District", "full_address", "Cause", "Apn"]:
         if col in df.columns:
-            df[col] = df[col].astype(str).fillna("")
+            df[col] = df[col].fillna("").astype(str)
+
+    # LAHD's CSV sometimes parses district numbers as floats (for example,
+    # "3.0"). Store a canonical integer-looking label for filtering, popups,
+    # and exports while retaining non-numeric source values if they occur.
+    district_numeric = pd.to_numeric(df["Council District"], errors="coerce")
+    df.loc[district_numeric.notna(), "Council District"] = (
+        district_numeric[district_numeric.notna()].astype(int).astype(str)
+    )
+    df.loc[district_numeric.eq(0), "Council District"] = ""
 
     # Clean Rent Owed numeric
     if "Rent Owed" in df.columns:
@@ -67,7 +165,7 @@ def load_evictions(path):
     # Date received → Date_Filed
     if "Date Received" in df.columns:
         df["Date_Filed"] = pd.to_datetime(
-            df["Date Received"], errors="coerce", format="%m-%d-%Y"
+            df["Date Received"], errors="coerce", format="mixed"
         )
     else:
         df["Date_Filed"] = pd.NaT
@@ -105,6 +203,13 @@ def load_evictions(path):
                     )
                 )
             ),
+            Zip=("Zip", "first"),
+            Bedroom=("Bedroom", "first"),
+            Notice_Type=("Notice Type", "first"),
+            Eviction_Category=("Eviction Category", "first"),
+            Owner=("Owner", "first"),
+            Owner_Name=("Owner Name", "first"),
+            Unit_Count=("Unit Count", "first"),
         )
     )
 
@@ -121,9 +226,83 @@ def load_evictions(path):
     agg["Eviction_Count"] = agg["Eviction_Count"].fillna(0).astype(int)
     agg["repeat_count"] = agg["repeat_count"].fillna(0).astype(int)
     agg["Cause"] = agg["Cause"].fillna("")
+    agg["Cause_Category"] = agg["Cause"].map(cause_category)
     agg["Apn"] = agg["Apn"].fillna("")
+    agg["Zip"] = normalize_zip(agg["Zip"])
+    for col in ["Notice_Type", "Eviction_Category", "Owner", "Owner_Name"]:
+        agg[col] = agg[col].fillna("").astype(str)
 
     return agg
+
+
+@st.cache_data(show_spinner="Loading Zillow ZIP rent data…")
+def load_zori_zip(path, modified_at):
+    """Load the supplied Zillow ZORI series at ZIP-by-month grain."""
+    del modified_at
+    if not os.path.exists(path):
+        return pd.DataFrame(), []
+
+    zori = pd.read_csv(path, dtype={"RegionName": str}, low_memory=False)
+    required = {"RegionName", "RegionType"}
+    if not required.issubset(zori.columns):
+        return pd.DataFrame(), []
+
+    month_columns = sorted(
+        column
+        for column in zori.columns
+        if pd.notna(pd.to_datetime(column, format="%Y-%m-%d", errors="coerce"))
+    )
+    if not month_columns:
+        return pd.DataFrame(), []
+
+    zori = zori[zori["RegionType"].eq("zip")].copy()
+    zori["ZIP"] = normalize_zip(zori["RegionName"])
+    zori = zori[zori["ZIP"].ne("")].drop_duplicates("ZIP").set_index("ZIP")
+    zori[month_columns] = zori[month_columns].apply(pd.to_numeric, errors="coerce")
+    return zori, month_columns
+
+
+@st.cache_data(show_spinner=False)
+def load_zip_boundaries(path, modified_at):
+    """Load generalized Census ZCTA polygons used for the ZIP rent overlay."""
+    del modified_at
+    if not os.path.exists(path):
+        return {"type": "FeatureCollection", "features": []}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"type": "FeatureCollection", "features": []}
+    if payload.get("type") != "FeatureCollection":
+        return {"type": "FeatureCollection", "features": []}
+    return payload
+
+
+@st.cache_data
+def load_rent_records(path):
+    """Load notice-level rent amounts for a no-bucket distribution view."""
+    needed = {"full_address", "Date Received", "Rent Owed", "Zip"}
+    records = pd.read_csv(
+        path,
+        usecols=lambda column: column in needed,
+        low_memory=False,
+    )
+    if not needed.issubset(records.columns):
+        return pd.DataFrame(columns=["full_address", "Date_Filed", "Rent_Owed", "Zip"])
+
+    records["Date_Filed"] = pd.to_datetime(
+        records["Date Received"], errors="coerce", format="%m-%d-%Y"
+    )
+    records["Rent_Owed"] = pd.to_numeric(
+        records["Rent Owed"]
+        .astype(str)
+        .str.replace(r"[^0-9.\-]", "", regex=True),
+        errors="coerce",
+    )
+    records["Zip"] = normalize_zip(records["Zip"])
+    return records[["full_address", "Date_Filed", "Rent_Owed", "Zip"]].dropna(
+        subset=["full_address", "Date_Filed", "Rent_Owed"]
+    )
 
 # ==============================
 # DATA LOADING — SUBDIV / NEIGHBORHOODS
@@ -185,7 +364,7 @@ def compute_subdiv_minus_neighborhood():
         return subdiv
 
     try:
-        nbhd_union = nbhd.unary_union
+        nbhd_union = nbhd.geometry.union_all()
         nbhd_union_gdf = gpd.GeoDataFrame(geometry=[nbhd_union], crs=subdiv.crs)
         diff = gpd.overlay(subdiv, nbhd_union_gdf, how="difference")
         if "Subdiv_Name" not in diff.columns and "Subdiv_Name" in subdiv.columns:
@@ -246,27 +425,9 @@ def filter_by_area(ev_df, area_choice, subdiv, nbhd, subdiv_minus):
 # ==============================
 # DATA LOADING — CPI (FRED)
 # ==============================
-@st.cache_data
-def load_cpi():
-    """Load CPI data from FRED, same series as Shiny (rent of primary residence)."""
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": FRED_SERIES_ID,
-        "api_key": FRED_API_KEY,
-        "file_type": "json",
-        "observation_start": "2015-01-01",
-    }
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json().get("observations", [])
-        df = pd.DataFrame(data)
-        df["date"] = pd.to_datetime(df["date"])
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        return df[["date", "value"]].dropna()
-    except Exception as e:
-        st.warning(f"Could not load CPI data from FRED: {e}")
-        return pd.DataFrame(columns=["date", "value"])
+@st.cache_data(ttl=3600)
+def load_cpi(api_key=""):
+    return fetch_rent_cpi(api_key)
 
 # ==============================
 # DATA LOADING — CENSUS
@@ -289,7 +450,7 @@ def load_neighborhood_census():
 # STREAMLIT APP LAYOUT
 # ==============================
 st.set_page_config(
-    page_title="EvictorBookLA 3D (WIP)",
+    page_title="EVICTOR BOOK ALPHA",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -309,6 +470,15 @@ st.markdown(
         background: rgba(255, 255, 255, 0.9);  /* tweak if you want darker */
         color: #0f172a;                         /* text color */
         box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+    }
+    :focus-visible { outline: 3px solid #ffbf47 !important; outline-offset: 2px; }
+    @media (max-width: 760px) {
+        .creator-badge { display: none; }
+        h1 { font-size: 1.8rem !important; }
+        [data-testid="stMetric"] { min-width: 150px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        * { scroll-behavior: auto !important; transition: none !important; }
     }
     </style>
 
@@ -332,17 +502,71 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-evictions = load_evictions(EVICTION_CSV)
+def _auto_refresh_if_due():
+    """Refresh from LAHD at most once per configured interval."""
+    try:
+        interval_hours = float(os.getenv("LAHD_AUTO_REFRESH_HOURS", "24"))
+    except ValueError:
+        interval_hours = 24
+    if interval_hours <= 0:
+        return None
+    refreshed_at = None
+    if METADATA_PATH.exists():
+        try:
+            metadata = json.loads(METADATA_PATH.read_text())
+            refreshed_at = pd.to_datetime(metadata.get("checked_at") or metadata.get("refreshed_at"), utc=True)
+        except Exception:
+            refreshed_at = None
+    now = pd.Timestamp.now(tz="UTC")
+    if refreshed_at is None or (now - refreshed_at).total_seconds() >= interval_hours * 3600:
+        with st.spinner("Checking LAHD for updated eviction notices…"):
+            result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=False, geocode=False)
+            st.cache_data.clear()
+            return result
+    return None
+
+
+@st.fragment(run_every="1h")
+def refresh_status():
+    try:
+        if _auto_refresh_if_due() is not None:
+            st.rerun()
+    except Exception as refresh_error:
+        st.warning(f"Automatic LAHD refresh failed; using the last validated local dataset. {refresh_error}")
+    if METADATA_PATH.exists():
+        metadata = json.loads(METADATA_PATH.read_text())
+        if metadata.get("status") == "retained_newer_local_data":
+            st.info(metadata.get("message"))
+
+
+refresh_status()
+
+evictions = load_evictions(EVICTION_CSV, os.path.getmtime(EVICTION_CSV))
+if os.path.exists(ZORI_ZIP_CSV):
+    zori_zip, zori_month_columns = load_zori_zip(
+        ZORI_ZIP_CSV,
+        os.path.getmtime(ZORI_ZIP_CSV),
+    )
+else:
+    zori_zip, zori_month_columns = pd.DataFrame(), []
+if os.path.exists(ZCTA_GEOJSON):
+    zip_boundaries = load_zip_boundaries(
+        ZCTA_GEOJSON,
+        os.path.getmtime(ZCTA_GEOJSON),
+    )
+else:
+    zip_boundaries = {"type": "FeatureCollection", "features": []}
 subdiv = load_subdivisions()
 nbhd = load_neighborhoods()
 subdiv_minus = compute_subdiv_minus_neighborhood()
-cpi_df = load_cpi()
+cpi_df, cpi_source, cpi_notes = load_cpi(FRED_API_KEY)
 census_df = load_neighborhood_census()
 
 # ==============================
 # BUILD NEIGHBORHOOD CHOROPLETH GEOJSON
 # ==============================
 nbhd_choro_json = "null"
+nbhd_demo = gpd.GeoDataFrame()
 
 if not nbhd.empty and not census_df.empty:
     # Join neighborhood geometries with census metrics
@@ -410,7 +634,7 @@ def clear_chart_filters():
     st.session_state["rent_filter"] = None
 
 st.markdown(
-    "<h1 style='font-size: 2.5rem; font-weight: 700;'>EvictorBookLA — 3D Map (WIP)</h1>",
+    "<h1 style='font-size: 2.5rem; font-weight: 700;'>EVICTOR BOOK ALPHA</h1>",
     unsafe_allow_html=True,
 )
 st.caption(
@@ -430,25 +654,41 @@ if evictions.empty:
 # ==============================
 st.sidebar.image(
     "la_logo.png",
-    width=30,         
-    use_column_width=False
+    width=30,
 )
-st.sidebar.header("EvictorBookLA")
+st.sidebar.header("EVICTOR BOOK ALPHA")
+
+shared_view = {}
+try:
+    encoded_view = st.query_params.get("view")
+    if encoded_view:
+        shared_view = json.loads(base64.b64decode(encoded_view).decode("utf-8"))
+except Exception:
+    shared_view = {}
 
 min_date = evictions["Date_Filed"].min()
 max_date = evictions["Date_Filed"].max()
 
 date_range = st.sidebar.date_input(
     "Eviction Date Range",
-    value=(min_date, max_date),
+    value=(
+        pd.to_datetime(shared_view.get("start_date", min_date)).date(),
+        pd.to_datetime(shared_view.get("end_date", max_date)).date(),
+    ),
     min_value=min_date,
     max_value=max_date,
 )
 
-if isinstance(date_range, tuple):
-    start_date, end_date = date_range
+# During range selection Streamlit briefly returns a one-item tuple after the
+# first click. Treat that as a valid single-day range until the second date is
+# chosen instead of trying to unpack two values.
+selected_dates = list(date_range) if isinstance(date_range, (tuple, list)) else [date_range]
+if len(selected_dates) >= 2:
+    start_date, end_date = selected_dates[0], selected_dates[1]
+elif len(selected_dates) == 1 and selected_dates[0] is not None:
+    start_date = end_date = selected_dates[0]
 else:
-    start_date, end_date = min_date, max_date
+    start_date, end_date = min_date.date(), max_date.date()
 
 min_evict_count = st.sidebar.number_input(
     "Minimum Evictions at Address",
@@ -471,8 +711,80 @@ if not subdiv_minus.empty and "Subdiv_Name" in subdiv_minus.columns:
 selected_area = st.sidebar.selectbox(
     "Filter by Area (Neighborhood / Subdivision)",
     options=area_choices,
-    index=0,
+    index=area_choices.index(shared_view.get("area")) if shared_view.get("area") in area_choices else 0,
 )
+
+zip_values = normalize_zip(evictions["Zip"])
+zip_options = sorted(zip_values[zip_values.ne("")].unique())
+selected_zori_month = None
+zori_by_zip = pd.Series(dtype="float64")
+
+with st.sidebar.expander("ZIP and Zillow rent overlay", expanded=True):
+    if zori_month_columns and not zori_zip.empty:
+        available_months = [
+            month
+            for month in zori_month_columns
+            if zori_zip.reindex(zip_options)[month].notna().any()
+        ]
+        requested_month = shared_view.get("zori_month")
+        default_month = requested_month if requested_month in available_months else available_months[-1]
+        selected_zori_month = st.selectbox(
+            "ZORI month",
+            available_months,
+            index=available_months.index(default_month),
+            format_func=lambda month: pd.to_datetime(month).strftime("%B %Y"),
+            help="Zillow Observed Rent Index (ZORI) is a smoothed estimate of typical market asking rent.",
+        )
+        zori_by_zip = zori_zip[selected_zori_month].reindex(zip_options)
+        covered_zori = zori_by_zip.dropna()
+        st.caption(
+            f"{covered_zori.size} of {len(zip_options)} mapped ZIP codes have Zillow data for "
+            f"{pd.to_datetime(selected_zori_month).strftime('%B %Y')}."
+        )
+        st.caption(
+            "The month controls the ZIP overlay. ZORI is a market asking-rent index, "
+            "not the rent paid by a particular tenant."
+        )
+    else:
+        st.info("Zillow ZIP rent data is unavailable; ZIP filtering still works.")
+
+    selected_zips = st.multiselect(
+        "ZIP codes",
+        zip_options,
+        default=[x for x in shared_view.get("zips", []) if x in zip_options],
+        format_func=lambda zip_code: (
+            f"{zip_code} — ${zori_by_zip.get(zip_code):,.0f} ZORI"
+            if zip_code in zori_by_zip.index and pd.notna(zori_by_zip.get(zip_code))
+            else f"{zip_code} — no ZORI data"
+        ),
+    )
+
+with st.sidebar.expander("Advanced filters", expanded=False):
+    available_cause_categories = set(evictions["Cause_Category"].dropna())
+    cause_options = [category for category in CAUSE_CATEGORY_ORDER if category in available_cause_categories]
+    selected_causes = st.multiselect(
+        "Cause category",
+        cause_options,
+        default=[x for x in shared_view.get("causes", []) if x in cause_options],
+    )
+    district_values = evictions["Council_District"].dropna().astype(str).str.strip()
+    available_districts = set(district_values)
+    district_options = [str(number) for number in range(1, 16) if str(number) in available_districts]
+    selected_districts = st.multiselect("Council district", district_options, default=[x for x in shared_view.get("districts", []) if x in district_options])
+    apn_query = st.text_input("APN", value=shared_view.get("apn", ""), placeholder="e.g. 6132001016")
+    address_query = st.text_input("Address contains", value=shared_view.get("address", ""))
+    repeat_min = st.number_input("Minimum repeat filings", 1, 500, int(shared_view.get("minimum_repeat_filings", 1)))
+    positive_rent = evictions.loc[evictions["Total_Rent_Owed"] > 0, "Total_Rent_Owed"]
+    rent_cap = int(max(1, positive_rent.max())) if not positive_rent.empty else 1
+    rent_range = st.slider(
+        "Reported rent owed",
+        0,
+        rent_cap,
+        (0, rent_cap),
+        format="$%d",
+    )
+
+st.sidebar.caption("Counts represent notices, not confirmed court-ordered removals.")
 
 st.sidebar.button("Clear Chart-Based Filters", on_click=clear_chart_filters)
 
@@ -516,7 +828,27 @@ mask_date = (evictions["Date_Filed"] >= pd.to_datetime(start_date)) & (
 mask_count = evictions["Eviction_Count"] >= min_evict_count
 
 ev_filtered = evictions.loc[mask_date & mask_count].copy()
+if selected_zori_month is not None:
+    ev_filtered["ZORI_Rent"] = ev_filtered["Zip"].map(zori_by_zip)
+else:
+    ev_filtered["ZORI_Rent"] = np.nan
 ev_filtered = filter_by_area(ev_filtered, selected_area, subdiv, nbhd, subdiv_minus)
+
+if selected_causes:
+    ev_filtered = ev_filtered[ev_filtered["Cause_Category"].isin(selected_causes)]
+if selected_districts:
+    ev_filtered = ev_filtered[ev_filtered["Council_District"].astype(str).isin(selected_districts)]
+if selected_zips:
+    ev_filtered = ev_filtered[ev_filtered["Zip"].isin(selected_zips)]
+if apn_query.strip():
+    ev_filtered = ev_filtered[ev_filtered["Apn"].str.contains(apn_query.strip(), case=False, regex=False)]
+if address_query.strip():
+    ev_filtered = ev_filtered[ev_filtered["full_address"].str.contains(address_query.strip(), case=False, regex=False)]
+ev_filtered = ev_filtered[ev_filtered["repeat_count"] >= repeat_min]
+ev_filtered = ev_filtered[
+    ev_filtered["Total_Rent_Owed"].between(rent_range[0], rent_range[1])
+    | ((rent_range[0] == 0) & (ev_filtered["Total_Rent_Owed"] == 0))
+]
 
 # ---- Extra interactive filters from charts ----
 trend_filter = st.session_state.get("trend_filter")
@@ -540,9 +872,10 @@ if ev_filtered.empty:
     st.warning("No evictions in this date range / filter / area.")
     st.stop()
 
-# Stable ID for JS ↔ Python linkage
+# Stable address ID for JS ↔ Python linkage. All filing-date rows at the
+# same address share an ID, so polygon selections still return every row.
 ev_filtered = ev_filtered.reset_index(drop=True).copy()
-ev_filtered["js_id"] = ev_filtered.index.astype(int)
+ev_filtered["map_id"] = pd.factorize(ev_filtered["full_address"], sort=True)[0]
 
 # ==============================
 # READ SELECTION FROM URL (?sel=...)
@@ -570,7 +903,7 @@ if sel_param:
         selected_ids = []
 
 if selected_ids:
-    ev_selected = ev_filtered[ev_filtered["js_id"].isin(selected_ids)].copy()
+    ev_selected = ev_filtered[ev_filtered["map_id"].isin(selected_ids)].copy()
 else:
     ev_selected = pd.DataFrame(columns=ev_filtered.columns)
 
@@ -580,29 +913,96 @@ else:
 ev_js = ev_filtered.copy()
 ev_js["Date_Filed_str"] = ev_js["Date_Filed"].dt.strftime("%m-%d-%Y")
 
-records = ev_js[
-    [
-        "js_id",
-        "full_address",
-        "Date_Filed_str",
-        "Eviction_Count",
-        "Cause",
-        "Council_District",
-        "Total_Rent_Owed",
-        "Apn",
-        "lat",
-        "long",
-    ]
-].to_dict(orient="records")
+# Render one point per address instead of one point per address-date. This
+# cuts the default map workload by roughly two thirds while keeping all rows
+# available to the charts, downloads, and polygon-selected Python results.
+monthly_address = (
+    ev_js.assign(month_key=ev_js["Date_Filed"].dt.strftime("%Y-%m"))
+    .groupby(["map_id", "month_key"], as_index=False)["Eviction_Count"]
+    .sum()
+)
+monthly_address["month_part"] = (
+    monthly_address["month_key"] + ":" + monthly_address["Eviction_Count"].astype(int).astype(str)
+)
+monthly_lookup = monthly_address.groupby("map_id")["month_part"].agg(",".join)
 
-evictions_json = json.dumps(records)
+map_data = (
+    ev_js.groupby(["map_id", "full_address"], as_index=False, sort=False)
+    .agg(
+        date_min=("Date_Filed", "min"),
+        date_max=("Date_Filed", "max"),
+        Eviction_Count=("Eviction_Count", "sum"),
+        Cause=("Cause", lambda values: ", ".join(sorted({v for v in values if v}))),
+        Council_District=("Council_District", "first"),
+        Total_Rent_Owed=("Total_Rent_Owed", "sum"),
+        Apn=("Apn", lambda values: ", ".join(sorted({v for v in values if v}))),
+        repeat_count=("Date_Filed", "nunique"),
+        Zip=("Zip", "first"),
+        ZORI_Rent=("ZORI_Rent", "first"),
+        lat=("lat", "first"),
+        long=("long", "first"),
+    )
+)
+date_min = map_data["date_min"].dt.strftime("%m-%d-%Y")
+date_max = map_data["date_max"].dt.strftime("%m-%d-%Y")
+map_data["Date_Filed_str"] = np.where(date_min.eq(date_max), date_min, date_min + " to " + date_max)
+map_data["month_counts"] = map_data["map_id"].map(monthly_lookup).fillna("")
 
-# --- Neighborhood GeoJSON for base overlay ---
-if not nbhd.empty:
-    nbhd_export = nbhd[["name", "geometry"]].copy()
-    nbhd_geojson = nbhd_export.to_json()
-else:
-    nbhd_geojson = json.dumps({"type": "FeatureCollection", "features": []})
+map_columns = [
+    "map_id",
+    "full_address",
+    "Date_Filed_str",
+    "Eviction_Count",
+    "Cause",
+    "Council_District",
+    "Total_Rent_Owed",
+    "Apn",
+    "repeat_count",
+    "Zip",
+    "ZORI_Rent",
+    "lat",
+    "long",
+    "month_counts",
+]
+for column in ["full_address", "Date_Filed_str", "Cause", "Council_District", "Apn", "Zip"]:
+    map_data[column] = map_data[column].fillna("").astype(str)
+for column in ["map_id", "Eviction_Count", "Total_Rent_Owed", "repeat_count", "lat", "long"]:
+    map_data[column] = pd.to_numeric(map_data[column], errors="coerce").fillna(0)
+map_data["ZORI_Rent"] = pd.to_numeric(map_data["ZORI_Rent"], errors="coerce").round(2)
+
+# Compact row arrays avoid repeating twelve field names for every point and
+# prevent a second full copy of the records in the browser.
+records = (
+    map_data[map_columns]
+    .astype(object)
+    .where(pd.notna(map_data[map_columns]), None)
+    .values.tolist()
+)
+evictions_json = json.dumps(
+    records,
+    separators=(",", ":"),
+    ensure_ascii=False,
+).replace("</", "<\\/")
+
+# Join the selected Zillow month to official Census ZCTA polygons. The
+# geometry stays fixed while the month-specific rent values update on rerun.
+zip_overlay = copy.deepcopy(zip_boundaries)
+selected_zip_set = set(selected_zips)
+for feature in zip_overlay.get("features", []):
+    properties = feature.setdefault("properties", {})
+    zip_code = str(properties.get("GEOID") or properties.get("ZCTA5") or "").zfill(5)
+    properties["zip"] = zip_code
+    properties["selected"] = zip_code in selected_zip_set
+    zori_value = zori_by_zip.get(zip_code) if selected_zori_month is not None else np.nan
+    if pd.notna(zori_value):
+        properties["zori_rent"] = round(float(zori_value), 2)
+    else:
+        properties.pop("zori_rent", None)
+zori_zip_json = json.dumps(
+    zip_overlay,
+    separators=(",", ":"),
+    ensure_ascii=False,
+).replace("</", "<\\/")
 
 # ==============================
 # EMBEDDED HTML: MAPBOX GL JS + DRAW
@@ -612,10 +1012,10 @@ html_template = """
 <html>
 <head>
 <meta charset="utf-8" />
-<title>EvictorBookLA 3D</title>
+<title>EvictorBookLA Atlas</title>
 <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
 
-<!-- Mapbox GL core (v2.15.0 – stable with Draw) -->
+<!-- Mapbox GL core (v2.15.0 – stable with Draw and 3D buildings) -->
 <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet" />
 <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
 
@@ -641,6 +1041,17 @@ html_template = """
   .mapboxgl-popup {
     max-width: 300px;
     font: 12px/1.4 'Helvetica Neue', Arial, Helvetica, sans-serif;
+  }
+  #map-status {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+    color: #334155;
+    background: #eef3f7;
+    font-size: 14px;
   }
 
   /* Address search bar  */
@@ -693,6 +1104,23 @@ html_template = """
   #choropleth-select {
     margin-left: 4px;
     font-size: 11px;
+    max-width: 260px;
+  }
+  #overlay-legend {
+    display: none;
+    margin-top: 6px;
+    min-width: 210px;
+    color: #334155;
+  }
+  #overlay-legend-gradient {
+    height: 8px;
+    margin: 3px 0 2px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #eff3ff, #6baed6, #08306b);
+  }
+  #overlay-legend-labels {
+    display: flex;
+    justify-content: space-between;
   }
 
   /* Selection info panel */
@@ -754,6 +1182,7 @@ html_template = """
 </head>
 <body>
 <div id="map"></div>
+<div id="map-status">Loading eviction map…</div>
 
 <!-- Address search UI -->
 <div id="search-container">
@@ -765,11 +1194,28 @@ html_template = """
 <div id="choropleth-controls">
   <label for="choropleth-select">Overlay:</label>
   <select id="choropleth-select">
-    <option value="none" selected>No overlay</option>
+    <option value="zori_rent" selected>Zillow asking rent by ZIP (ZORI_MONTH_PLACEHOLDER)</option>
+    <option value="none">No overlay</option>
     <option value="evictions_total">Total evictions (all years)</option>
     <option value="median_income">Median income</option>
-    <option value="rent_burden_pct">Severe rent burden ≥50%</option>
+    <option value="rent_burden_pct">Reported rent burden (definition unverified)</option>
   </select>
+  <div id="overlay-legend" aria-live="polite">
+    <div id="overlay-legend-title"></div>
+    <div id="overlay-legend-gradient"></div>
+    <div id="overlay-legend-labels"><span id="overlay-legend-min"></span><span id="overlay-legend-max"></span></div>
+  </div>
+  <br/>
+  <label for="map-mode-select">Map:</label>
+  <select id="map-mode-select">
+    <option value="clusters" selected>Clusters</option>
+    <option value="points">Individual points</option>
+    <option value="heatmap">Density heatmap</option>
+  </select>
+  <br/>
+  <button id="animation-btn" type="button" aria-label="Play monthly animation">▶ Animate</button>
+  <select id="animation-speed" aria-label="Animation speed"><option value="1500">Slow</option><option value="900" selected>Normal</option><option value="400">Fast</option></select>
+  <span id="animation-label">All dates</span>
 </div>
 
 
@@ -784,34 +1230,39 @@ html_template = """
   <button id="download-selected-btn" type="button">
     ⬇ Download Selected as CSV
   </button>
+  <button id="download-polygons-btn" type="button">⬇ Polygons GeoJSON</button>
   <ol id="selection-list"></ol>
 </div>
 
 <!-- Neighborhood hover info panel (bottom-left) -->
 <div id="nbhd-info-panel">
   <div id="nbhd-info-content">
-    Hover over a shaded neighborhood to view total evictions, median income, and severe rent burden.
+    Hover over a shaded ZIP code to view Zillow typical asking rent.
   </div>
 </div>
 
 <script>
   mapboxgl.accessToken = "MAPBOX_TOKEN_PLACEHOLDER";
 
-  // Eviction data from Streamlit
-  const evictions = EVIC_DATA_PLACEHOLDER;
+  // Compact eviction rows from Streamlit. Keeping these as arrays avoids
+  // retaining a second full object copy of the map dataset.
+  const evictionRows = EVIC_DATA_PLACEHOLDER;
+  const IDX = {
+    id: 0, address: 1, date: 2, count: 3, cause: 4, district: 5,
+    rent: 6, apn: 7, repeat: 8, zip: 9, zori: 10, lat: 11, lng: 12, months: 13
+  };
+  const zoriMonthLabel = "ZORI_MONTH_PLACEHOLDER";
 
   // Neighborhood choropleth data (census + CPI-adjusted income, etc.)
   const nbhdChoro = NBHD_CHORO_PLACEHOLDER;
+  // Census ZCTA polygons joined to the selected Zillow ZORI month.
+  const zipZoriChoro = ZIP_ZORI_CHORO_PLACEHOLDER;
 
-  // Neighborhood polygons from Streamlit (basic outline)
-  const neighborhoods = NBHD_DATA_PLACEHOLDER;
-
-  // Build GeoJSON with clustering enabled
-  // Build GeoJSON with slight jitter for identical coordinates
+  // Build GeoJSON with slight jitter for identical coordinates.
 const jitterTracker = {};
-const evictionFeatures = evictions.map((e) => {
-  const baseLng = e.long;
-  const baseLat = e.lat;
+const evictionFeatures = evictionRows.map((row) => {
+  const baseLng = Number(row[IDX.lng]);
+  const baseLat = Number(row[IDX.lat]);
 
   // Key rounded to ~meter level to group "same" coordinates
   const key = `${baseLng.toFixed(5)}|${baseLat.toFixed(5)}`;
@@ -831,14 +1282,18 @@ const evictionFeatures = evictions.map((e) => {
   return {
     "type": "Feature",
     "properties": {
-      id: e.js_id,
-      full_address: e.full_address,
-      date_filed: e.Date_Filed_str,
-      eviction_count: e.Eviction_Count,
-      cause: e.Cause,
-      council_district: e.Council_District,
-      total_rent_owed: e.Total_Rent_Owed,
-      apn: e.Apn
+      id: row[IDX.id],
+      full_address: row[IDX.address],
+      date_filed: row[IDX.date],
+      eviction_count: row[IDX.count],
+      cause: row[IDX.cause],
+      council_district: row[IDX.district],
+      total_rent_owed: row[IDX.rent],
+      apn: row[IDX.apn],
+      repeat_count: row[IDX.repeat],
+      zip: row[IDX.zip],
+      zori_rent: row[IDX.zori],
+      month_counts: row[IDX.months]
     },
     "geometry": {
       "type": "Point",
@@ -851,6 +1306,8 @@ const evictionGeojson = {
   "type": "FeatureCollection",
   "features": evictionFeatures
 };
+// The compact transport rows are no longer needed after GeoJSON creation.
+evictionRows.length = 0;
 
 
   // Center the map above Los Angeles (fixed default)
@@ -870,12 +1327,24 @@ const evictionGeojson = {
   let draw = null;
   try {
     if (typeof MapboxDraw !== "undefined") {
+      const drawStyles = [
+        {id:"gl-draw-polygon-fill-inactive",type:"fill",filter:["all",["==","active","false"],["==","$type","Polygon"],["!=","mode","static"]],paint:{"fill-color":"#1E90FF","fill-outline-color":"#1E90FF","fill-opacity":0.18}},
+        {id:"gl-draw-polygon-fill-active",type:"fill",filter:["all",["==","active","true"],["==","$type","Polygon"]],paint:{"fill-color":"#1E90FF","fill-outline-color":"#1E90FF","fill-opacity":0.25}},
+        {id:"gl-draw-polygon-midpoint",type:"circle",filter:["all",["==","$type","Point"],["==","meta","midpoint"]],paint:{"circle-radius":3,"circle-color":"#1E90FF"}},
+        {id:"gl-draw-polygon-stroke-inactive",type:"line",filter:["all",["==","active","false"],["==","$type","Polygon"],["!=","mode","static"]],layout:{"line-cap":"round","line-join":"round"},paint:{"line-color":"#1E90FF","line-width":2}},
+        {id:"gl-draw-polygon-stroke-active",type:"line",filter:["all",["==","active","true"],["==","$type","Polygon"]],layout:{"line-cap":"round","line-join":"round"},paint:{"line-color":"#1E90FF","line-width":2}},
+        {id:"gl-draw-line-inactive",type:"line",filter:["all",["==","active","false"],["==","$type","LineString"],["!=","mode","static"]],layout:{"line-cap":"round","line-join":"round"},paint:{"line-color":"#1E90FF","line-width":2}},
+        {id:"gl-draw-line-active",type:"line",filter:["all",["==","$type","LineString"],["==","active","true"]],layout:{"line-cap":"round","line-join":"round"},paint:{"line-color":"#1E90FF","line-width":2}},
+        {id:"gl-draw-polygon-and-line-vertex-stroke-inactive",type:"circle",filter:["all",["==","meta","vertex"],["==","$type","Point"],["!=","mode","static"]],paint:{"circle-radius":5,"circle-color":"#ffffff"}},
+        {id:"gl-draw-polygon-and-line-vertex-inactive",type:"circle",filter:["all",["==","meta","vertex"],["==","$type","Point"],["!=","mode","static"]],paint:{"circle-radius":3,"circle-color":"#1E90FF"}}
+      ];
       draw = new MapboxDraw({
         displayControlsDefault: false,
         controls: {
           polygon: true,
           trash: true
         },
+        styles: drawStyles,
         defaultMode: "simple_select"
       });
       map.addControl(draw, "top-left");
@@ -885,6 +1354,19 @@ const evictionGeojson = {
   }
 
   map.addControl(new mapboxgl.NavigationControl(), "top-right");
+
+  const mapStatus = document.getElementById("map-status");
+  const loadTimeout = window.setTimeout(() => {
+    if (mapStatus) {
+      mapStatus.textContent = "The basemap is taking longer than expected. Check the internet connection and reload.";
+    }
+  }, 15000);
+  window.addEventListener("error", (event) => {
+    if (mapStatus) {
+      mapStatus.style.display = "flex";
+      mapStatus.textContent = "Map error: " + (event.message || "unknown error");
+    }
+  });
 
   // Keep last selection in memory so we can download as CSV
   let lastSelectedFeatures = [];
@@ -916,7 +1398,7 @@ const evictionGeojson = {
 
     summaryDiv.innerHTML = `
       <b>Selected nodes:</b> ${nodeCount.toLocaleString()}<br/>
-      <b>Approx Tenants Evicted (sum of Tenant Evictions):</b> ${unitCount.toLocaleString()}<br/>
+      <b>Notice records:</b> ${unitCount.toLocaleString()}<br/>
       <b>Total rent owed (approx):</b> $${totalRent.toLocaleString("en-US", {
         maximumFractionDigits: 0
       })}<br/>
@@ -984,10 +1466,11 @@ const evictionGeojson = {
       return;
     }
 
-    const polygon = data.features[data.features.length - 1];
-
+    const polygons = data.features.filter(f =>
+      f.geometry && (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon")
+    );
     const selectedFeatures = evictionGeojson.features.filter(f =>
-      turf.booleanPointInPolygon(f, polygon)
+      polygons.some(polygon => turf.booleanPointInPolygon(f, polygon))
     );
 
     updateSelectionPanel(selectedFeatures);
@@ -1011,6 +1494,9 @@ const evictionGeojson = {
       "council_district",
       "total_rent_owed",
       "apn",
+      "zip",
+      "zori_month",
+      "zori_typical_asking_rent",
       "longitude",
       "latitude"
     ];
@@ -1028,6 +1514,9 @@ const evictionGeojson = {
         p.council_district || "",
         p.total_rent_owed || "",
         p.apn || "",
+        p.zip || "",
+        zoriMonthLabel || "",
+        p.zori_rent == null ? "" : p.zori_rent,
         coords[0] != null ? coords[0] : "",
         coords[1] != null ? coords[1] : ""
       ].map(v => {
@@ -1051,6 +1540,18 @@ const evictionGeojson = {
 
   document.getElementById("download-selected-btn")
     .addEventListener("click", downloadSelectedAsCSV);
+
+  document.getElementById("download-polygons-btn").addEventListener("click", () => {
+    if (!draw || !draw.getAll().features.length) {
+      alert("Draw one or more polygons first.");
+      return;
+    }
+    const blob = new Blob([JSON.stringify(draw.getAll(), null, 2)], {type: "application/geo+json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "evictorbookla_selection_polygons.geojson"; a.click();
+    URL.revokeObjectURL(url);
+  });
 
   // Address search (within eviction dataset)
   function flyToAddressFromInput() {
@@ -1089,14 +1590,20 @@ const evictionGeojson = {
       minimumFractionDigits: 2,
       maximumFractionDigits: 2
     });
+    const hasZori = props.zori_rent !== null && props.zori_rent !== "" && Number.isFinite(Number(props.zori_rent));
+    const zoriFormatted = hasZori
+      ? `$${Number(props.zori_rent).toLocaleString("en-US", {maximumFractionDigits: 0})} (${zoriMonthLabel})`
+      : "N/A";
 
     const html = `
       <div style="font-size:12px;line-height:1.4">
         <strong>Address:</strong> ${props.full_address}<br/>
-        <strong>Date Filed:</strong> ${props.date_filed}<br/>
+        <strong>Filing period:</strong> ${props.date_filed}<br/>
         <strong>Tenants Evicted:</strong> ${props.eviction_count}<br/>
         <strong>Cause:</strong> ${props.cause || "N/A"}<br/>
         <strong>Council District:</strong> ${props.council_district || "N/A"}<br/>
+        <strong>ZIP:</strong> ${props.zip || "N/A"}<br/>
+        <strong>Zillow typical asking rent:</strong> ${zoriFormatted}<br/>
         <strong>Total Rent Owed:</strong> $${rentFormatted}<br/>
         <strong>APN:</strong> ${props.apn || "N/A"}
       </div>
@@ -1122,6 +1629,8 @@ const evictionGeojson = {
   // Map load + layers
   // ==========================
   map.on("load", () => {
+    window.clearTimeout(loadTimeout);
+    if (mapStatus) mapStatus.textContent = "Loading eviction clusters…";
     const nbhdInfoContent = document.getElementById("nbhd-info-content");
 
     function setNbhdInfo(html) {
@@ -1130,7 +1639,14 @@ const evictionGeojson = {
       }
     }
 
-        function bindNeighborhoodHover(layerId) {
+    function defaultOverlayMessage() {
+      const selectedOverlay = document.getElementById("choropleth-select").value;
+      return selectedOverlay === "zori_rent"
+        ? "Hover over a shaded ZIP code to view Zillow typical asking rent."
+        : "Hover over a shaded neighborhood to view its overlay values.";
+    }
+
+    function bindNeighborhoodHover(layerId) {
       if (!map.getLayer(layerId)) return;
       if (!nbhdChoro || !nbhdChoro.features) return;
 
@@ -1158,87 +1674,59 @@ const evictionGeojson = {
           `<b>${name}</b><br/>` +
           `Total evictions (all years): ${totalStr}<br/>` +
           `Median income: ${incStr}<br/>` +
-          `Severe rent burden (≥50%): ${rbStr}`
+          `Reported rent burden (definition unverified): ${rbStr}`
         );
       });
 
       map.on("mouseleave", layerId, () => {
-        setNbhdInfo(
-          "Hover over a shaded neighborhood to view total evictions, median income, and severe rent burden."
-        );
+        setNbhdInfo(defaultOverlayMessage());
       });
     }
 
+    function bindZipHover(layerId) {
+      if (!map.getLayer(layerId)) return;
+      map.on("mousemove", layerId, (e) => {
+        if (!e.features || !e.features.length) return;
+        const p = e.features[0].properties || {};
+        const rent = Number(p.zori_rent);
+        const rentLabel = Number.isFinite(rent)
+          ? "$" + rent.toLocaleString("en-US", {maximumFractionDigits: 0})
+          : "No Zillow observation";
+        setNbhdInfo(
+          `<b>ZIP ${p.zip || p.GEOID || "Unknown"}</b><br/>` +
+          `Zillow typical asking rent: ${rentLabel}<br/>` +
+          `Month: ${zoriMonthLabel}<br/>` +
+          `<span style="color:#64748b">Census ZCTA boundary; not a USPS delivery boundary.</span>`
+        );
+      });
+      map.on("mouseleave", layerId, () => setNbhdInfo(defaultOverlayMessage()));
+      map.on("mouseenter", layerId, () => { map.getCanvas().style.cursor = "pointer"; });
+      map.on("mouseleave", layerId, () => { map.getCanvas().style.cursor = ""; });
+    }
 
-    // 3D BUILDINGS LAYER
-    const layers = map.getStyle().layers;
+
+    // 3D BUILDINGS LAYER (only when the selected base style exposes one)
+    const layers = map.getStyle().layers || [];
     const labelLayer = layers.find(
       (layer) => layer.type === "symbol" && layer.layout && layer.layout["text-field"]
     );
     const labelLayerId = labelLayer ? labelLayer.id : undefined;
-
-    map.addLayer(
-      {
-        "id": "add-3d-buildings",
-        "source": "composite",
+    const existingExtrusions = layers.some(layer => layer.type === "fill-extrusion");
+    const buildingLayer = layers.find(layer => layer["source-layer"] === "building" && layer.source);
+    if (!existingExtrusions && buildingLayer) {
+      map.addLayer({
+        id: "add-3d-buildings",
+        source: buildingLayer.source,
         "source-layer": "building",
-        "filter": ["==", "extrude", "true"],
-        "type": "fill-extrusion",
-        "minzoom": 15,
-        "paint": {
-          "fill-extrusion-color": "#aaa",
-          "fill-extrusion-height": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            15, 0,
-            15.05, ["get", "height"]
-          ],
-          "fill-extrusion-base": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            15, 0,
-            15.05, ["get", "min_height"]
-          ],
+        type: "fill-extrusion",
+        minzoom: 15,
+        paint: {
+          "fill-extrusion-color": "#b8b8b8",
+          "fill-extrusion-height": ["coalesce", ["get", "render_height"], ["get", "height"], 0],
+          "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], ["get", "min_height"], 0],
           "fill-extrusion-opacity": 0.6
         }
-      },
-      labelLayerId
-    );
-
-        // NEIGHBORHOOD OUTLINE OVERLAY (start hidden)
-    if (neighborhoods && neighborhoods.type === "FeatureCollection") {
-      map.addSource("neighborhoods", {
-        type: "geojson",
-        data: neighborhoods
-      });
-
-      map.addLayer({
-        id: "neighborhood-fill",
-        type: "fill",
-        source: "neighborhoods",
-        paint: {
-          "fill-color": "#3182bd",
-          "fill-opacity": 0.12
-        },
-        layout: {
-          "visibility": "none"
-        }
-      });
-
-      map.addLayer({
-        id: "neighborhood-outline",
-        type: "line",
-        source: "neighborhoods",
-        paint: {
-          "line-color": "#08519c",
-          "line-width": 2.5
-        },
-        layout: {
-          "visibility": "none"
-        }
-      });
+      }, labelLayerId);
     }
 
 
@@ -1250,7 +1738,6 @@ const evictionGeojson = {
       clusterMaxZoom: 14,
       clusterRadius: 40
     });
-
     // Layer for clusters
     map.addLayer({
       id: "clusters",
@@ -1333,6 +1820,109 @@ map.addLayer({
   }
 });
 
+    // The unclustered source is expensive for a large dataset. Create it only
+    // when the user explicitly asks for points or a heatmap.
+    function ensureRawLayers() {
+      if (!map.getSource("evictions-raw")) {
+        map.addSource("evictions-raw", {type: "geojson", data: evictionGeojson});
+      }
+      if (!map.getLayer("all-points")) {
+        map.addLayer({
+          id: "all-points",
+          type: "circle",
+          source: "evictions-raw",
+          layout: {visibility: "none"},
+          paint: {
+            "circle-color": ["interpolate", ["linear"], ["get", "eviction_count"], 1, "#6baed6", 10, "#fb6a4a", 25, "#99000d"],
+            "circle-radius": ["interpolate", ["linear"], ["zoom"], 8, 2, 16, 8],
+            "circle-opacity": 0.75,
+            "circle-stroke-color": "#fff",
+            "circle-stroke-width": 0.5
+          }
+        });
+      }
+      if (!map.getLayer("eviction-heatmap")) {
+        map.addLayer({
+          id: "eviction-heatmap",
+          type: "heatmap",
+          source: "evictions-raw",
+          layout: {visibility: "none"},
+          paint: {
+            "heatmap-weight": ["interpolate", ["linear"], ["get", "eviction_count"], 0, 0, 20, 1],
+            "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 8, 1, 15, 3],
+            "heatmap-color": ["interpolate", ["linear"], ["heatmap-density"], 0, "rgba(0,0,255,0)", 0.2, "#deebf7", 0.5, "#6baed6", 0.8, "#fb6a4a", 1, "#99000d"],
+            "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 8, 12, 15, 30],
+            "heatmap-opacity": 0.82
+          }
+        });
+      }
+    }
+
+    const modeSelect = document.getElementById("map-mode-select");
+    function setMapMode(mode) {
+      if (mode !== "clusters") ensureRawLayers();
+      const clusterVisibility = mode === "clusters" ? "visible" : "none";
+      ["clusters", "cluster-count", "unclustered-point"].forEach(id => {
+        if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", clusterVisibility);
+      });
+      if (map.getLayer("all-points")) map.setLayoutProperty("all-points", "visibility", mode === "points" ? "visible" : "none");
+      if (map.getLayer("eviction-heatmap")) map.setLayoutProperty("eviction-heatmap", "visibility", mode === "heatmap" ? "visible" : "none");
+    }
+    if (modeSelect) modeSelect.addEventListener("change", e => setMapMode(e.target.value));
+
+    const months = [...new Set(
+      evictionGeojson.features.flatMap(f =>
+        String(f.properties.month_counts || "")
+          .split(",")
+          .map(part => part.split(":")[0])
+          .filter(Boolean)
+      )
+    )].sort();
+    let animationTimer = null;
+    let animationIndex = 0;
+    const animationBtn = document.getElementById("animation-btn");
+    const animationLabel = document.getElementById("animation-label");
+    function showAnimationMonth(monthKey) {
+      const monthFeatures = evictionGeojson.features.flatMap(f => {
+        const entry = String(f.properties.month_counts || "")
+          .split(",")
+          .find(part => part.startsWith(monthKey + ":"));
+        if (!entry) return [];
+        return [{
+          ...f,
+          properties: {...f.properties, eviction_count: Number(entry.split(":")[1]) || 0}
+        }];
+      });
+      const data = {type: "FeatureCollection", features: monthFeatures};
+      map.getSource("evictions").setData(data);
+      const rawSource = map.getSource("evictions-raw");
+      if (rawSource) rawSource.setData(data);
+      animationLabel.textContent = monthKey;
+    }
+    function stopAnimation(reset) {
+      if (animationTimer) clearInterval(animationTimer);
+      animationTimer = null;
+      animationBtn.textContent = "▶ Animate";
+      if (reset) {
+        map.getSource("evictions").setData(evictionGeojson);
+        const rawSource = map.getSource("evictions-raw");
+        if (rawSource) rawSource.setData(evictionGeojson);
+        animationLabel.textContent = "All dates";
+      }
+    }
+    if (animationBtn) animationBtn.addEventListener("click", () => {
+      if (animationTimer) { stopAnimation(true); return; }
+      animationBtn.textContent = "■ Stop";
+      animationIndex = 0;
+      if (months.length) showAnimationMonth(months[0]);
+      const speed = Number(document.getElementById("animation-speed").value || 900);
+      animationTimer = setInterval(() => {
+        animationIndex += 1;
+        if (animationIndex >= months.length) { stopAnimation(true); return; }
+        showAnimationMonth(months[animationIndex]);
+      }, speed);
+    });
+
 
     // Cluster click: zoom in
     map.on("click", "clusters", (e) => {
@@ -1362,16 +1952,23 @@ map.addLayer({
         minimumFractionDigits: 2,
         maximumFractionDigits: 2
       });
+      const hasZori = props.zori_rent !== null && props.zori_rent !== "" && Number.isFinite(Number(props.zori_rent));
+      const zoriFormatted = hasZori
+        ? `$${Number(props.zori_rent).toLocaleString("en-US", {maximumFractionDigits: 0})} (${zoriMonthLabel})`
+        : "N/A";
 
       const html = `
         <div style="font-size:12px;line-height:1.4">
           <strong>Address:</strong> ${props.full_address}<br/>
-          <strong>Date Filed:</strong> ${props.date_filed}<br/>
+          <strong>Filing period:</strong> ${props.date_filed}<br/>
           <strong>Number of Tenants Evicted:</strong> ${props.eviction_count}<br/>
           <strong>Cause:</strong> ${props.cause || "N/A"}<br/>
           <strong>Council District:</strong> ${props.council_district || "N/A"}<br/>
+          <strong>ZIP:</strong> ${props.zip || "N/A"}<br/>
+          <strong>Zillow typical asking rent:</strong> ${zoriFormatted}<br/>
           <strong>Total Rent Owed:</strong> $${rentFormatted}<br/>
           <strong>APN:</strong> ${props.apn || "N/A"}
+          <br/><strong>Address filing dates:</strong> ${props.repeat_count || 1}
         </div>
       `;
 
@@ -1430,7 +2027,7 @@ map.addLayer({
     });
 
     // ==========================
-    // Neighborhood choropleth overlays
+    // Neighborhood and ZIP choropleth overlays
     // ==========================
     if (nbhdChoro && nbhdChoro.type === "FeatureCollection" && nbhdChoro.features && nbhdChoro.features.length) {
       map.addSource("nbhd-choropleth-src", {
@@ -1438,54 +2035,114 @@ map.addLayer({
         data: nbhdChoro
       });
     }
+    if (zipZoriChoro && zipZoriChoro.type === "FeatureCollection" && zipZoriChoro.features && zipZoriChoro.features.length) {
+      map.addSource("zip-zori-src", {
+        type: "geojson",
+        data: zipZoriChoro
+      });
+    }
+
+    const legend = document.getElementById("overlay-legend");
+    const legendTitle = document.getElementById("overlay-legend-title");
+    const legendMin = document.getElementById("overlay-legend-min");
+    const legendMax = document.getElementById("overlay-legend-max");
+
+    function percentile(sortedValues, proportion) {
+      if (!sortedValues.length) return NaN;
+      const index = Math.max(0, Math.min(sortedValues.length - 1, Math.round((sortedValues.length - 1) * proportion)));
+      return sortedValues[index];
+    }
+
+    function formatOverlayValue(value, propertyName) {
+      if (propertyName === "zori_rent" || propertyName === "median_income") {
+        return "$" + Math.round(value).toLocaleString("en-US");
+      }
+      if (propertyName === "rent_burden_pct") return value.toFixed(1) + "%";
+      return Math.round(value).toLocaleString("en-US");
+    }
 
     function updateChoropleth(propertyName) {
-      const src = map.getSource("nbhd-choropleth-src");
-      if (!src) return;
-
-      // Remove previous layer if present
+      if (map.getLayer("zip-zori-outline")) map.removeLayer("zip-zori-outline");
       if (map.getLayer("nbhd-choropleth-layer")) {
         map.removeLayer("nbhd-choropleth-layer");
       }
+      if (legend) legend.style.display = "none";
+      if (!propertyName || propertyName === "none") {
+        setNbhdInfo("Choose an overlay to inspect neighborhood or ZIP values.");
+        return;
+      }
 
-      if (!propertyName || propertyName === "none") return;
-
-      const features = (nbhdChoro && nbhdChoro.features) ? nbhdChoro.features : [];
+      const isZori = propertyName === "zori_rent";
+      const sourceId = isZori ? "zip-zori-src" : "nbhd-choropleth-src";
+      if (!map.getSource(sourceId)) return;
+      const sourceData = isZori ? zipZoriChoro : nbhdChoro;
+      const features = (sourceData && sourceData.features) ? sourceData.features : [];
       const values = features
         .map(f => Number(f.properties[propertyName]))
         .filter(v => !isNaN(v) && isFinite(v));
 
       if (!values.length) return;
+      values.sort((a, b) => a - b);
 
-      const min = Math.min(...values);
-      const max = Math.max(...values);
+      // Zillow ZIP values have a long high-rent tail. Use a robust visual
+      // range while preserving exact values in the hover details.
+      const min = isZori ? percentile(values, 0.10) : values[0];
+      const max = isZori ? percentile(values, 0.90) : values[values.length - 1];
       if (!isFinite(min) || !isFinite(max) || min === max) return;
-
-      const mid = (min + max) / 2;
+      const mid = isZori ? percentile(values, 0.50) : (min + max) / 2;
 
       map.addLayer(
         {
           id: "nbhd-choropleth-layer",
           type: "fill",
-          source: "nbhd-choropleth-src",
+          source: sourceId,
           paint: {
             "fill-color": [
-              "interpolate",
-              ["linear"],
-              ["get", propertyName],
-              min, "#eff3ff",   // very light blue
-              mid, "#6baed6",   // medium blue
-              max, "#08306b"  
+              "case",
+              ["has", propertyName],
+              [
+                "interpolate",
+                ["linear"],
+                ["to-number", ["get", propertyName]],
+                min, "#eff3ff",
+                mid, "#6baed6",
+                max, "#08306b"
+              ],
+              "#cbd5e1"
             ],
-            "fill-opacity": 0.55,
+            "fill-opacity": ["case", ["has", propertyName], 0.58, 0.18],
             "fill-outline-color": "#555555"
           }
         },
-        "clusters"  // draw beneath eviction points
+        "clusters"
       );
 
-      // Enable hover info for this layer
-      bindNeighborhoodHover("nbhd-choropleth-layer");
+      if (isZori) {
+        map.addLayer({
+          id: "zip-zori-outline",
+          type: "line",
+          source: sourceId,
+          paint: {
+            "line-color": ["case", ["==", ["get", "selected"], true], "#f97316", "#475569"],
+            "line-width": ["case", ["==", ["get", "selected"], true], 3, 0.8],
+            "line-opacity": 0.9
+          }
+        }, "clusters");
+        bindZipHover("nbhd-choropleth-layer");
+        setNbhdInfo(defaultOverlayMessage());
+      } else {
+        bindNeighborhoodHover("nbhd-choropleth-layer");
+        setNbhdInfo(defaultOverlayMessage());
+      }
+
+      if (legend) {
+        legend.style.display = "block";
+        legendTitle.textContent = isZori
+          ? `Typical asking rent — ${zoriMonthLabel} (10th–90th percentile color range)`
+          : document.getElementById("choropleth-select").selectedOptions[0].textContent;
+        legendMin.textContent = formatOverlayValue(min, propertyName);
+        legendMax.textContent = formatOverlayValue(max, propertyName);
+      }
     }
 
     const choroSelect = document.getElementById("choropleth-select");
@@ -1493,7 +2150,17 @@ map.addLayer({
       choroSelect.addEventListener("change", (e) => {
         updateChoropleth(e.target.value);
       });
+      updateChoropleth(choroSelect.value);
     }
+    if (mapStatus) mapStatus.textContent = "Rendering eviction clusters…";
+    const finishMapLoad = () => {
+      const sourceFeatures = map.querySourceFeatures("evictions");
+      if (sourceFeatures.length > 0) {
+        if (mapStatus) mapStatus.style.display = "none";
+        map.off("idle", finishMapLoad);
+      }
+    };
+    map.on("idle", finishMapLoad);
   });
 </script>
 </body>
@@ -1501,18 +2168,29 @@ map.addLayer({
 """
 
 # Inject JSON + config into template
+zori_month_label = (
+    pd.to_datetime(selected_zori_month).strftime("%B %Y")
+    if selected_zori_month is not None
+    else "Unavailable"
+)
 html_final = (
     html_template
     .replace("EVIC_DATA_PLACEHOLDER", evictions_json)
     .replace("MAPBOX_TOKEN_PLACEHOLDER", MAPBOX_TOKEN)
     .replace("NBHD_CHORO_PLACEHOLDER", nbhd_choro_json)
-    .replace("NBHD_DATA_PLACEHOLDER", nbhd_geojson)
+    .replace("ZIP_ZORI_CHORO_PLACEHOLDER", zori_zip_json)
+    .replace("ZORI_MONTH_PLACEHOLDER", zori_month_label)
 )
 
 # ==============================
 # LAYOUT: MAP FULL-WIDTH + ANALYTICS BELOW
 # ==============================
 st.markdown("### 3D Eviction Map")
+if selected_zori_month is not None:
+    st.caption(
+        f"The default ZIP overlay shows Zillow ZORI for {zori_month_label}; selected ZIPs have an orange outline. "
+        "ZORI estimates typical market asking rent and is not a unit-level contract rent. ZIP areas use Census ZCTAs."
+    )
 components.html(html_final, height=720, scrolling=False)
 
 st.markdown("---")
@@ -1525,7 +2203,7 @@ total_addresses = ev_filtered["full_address"].nunique()
 total_rent = float(ev_filtered["Total_Rent_Owed"].sum())
 
 with sum_cols[0]:
-    st.metric("Total Evicted Tenants (filtered)", f"{total_units:,}")
+    st.metric("Notice records (filtered)", f"{total_units:,}")
 with sum_cols[1]:
     st.metric("Unique Address–Date Nodes", f"{len(ev_filtered):,}")
 with sum_cols[2]:
@@ -1595,14 +2273,25 @@ def _update_rent_filter():
     r_max = float(max(xs))
     st.session_state["rent_filter"] = (r_min, r_max)
 
+# Reuse the same notice-level population for the rent comparison and the
+# individualized rent-owed distribution. Address-date matching carries all
+# active map filters down to the original LAHD notice rows.
+rent_records = load_rent_records(EVICTION_CSV)
+selected_nodes = ev_filtered[["full_address", "Date_Filed"]].drop_duplicates()
+df_rent_records = rent_records.merge(
+    selected_nodes,
+    on=["full_address", "Date_Filed"],
+    how="inner",
+)
+
 # ==============================
 # ANALYTICS TABS 
 # ==============================
 tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
     [
         " Eviction Trend",
-        " CPI & Rent Index",
-        " Rent Owed Histogram",
+        " Rent Comparison",
+        " Rent Owed Distribution",
         " Eviction Causes",
         " Demographics (Census Data)",
     ]
@@ -1611,6 +2300,7 @@ tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
 # --- Eviction Trend (monthly) ---
 with tab_trend:
     st.subheader("Monthly Evictions")
+    st.caption("Counts are LAHD notice records received, not completed evictions or unique tenants. This chart follows map filters and includes only geocoded records. See Methods for all-source monthly coverage.")
     st.caption("Use mouse to click on a data point to view evictions of that month on the map. Click 'clear chart based filters' on the left to reset data.")
     df_trend = ev_filtered.copy()
     df_trend["month"] = df_trend["Date_Filed"].dt.to_period("M").dt.to_timestamp()
@@ -1646,7 +2336,7 @@ with tab_trend:
         )
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            width="stretch",
             key="trend_chart",
             on_select=_update_trend_filter,
             selection_mode="points",
@@ -1654,124 +2344,475 @@ with tab_trend:
         if st.session_state.get("trend_filter") is not None:
             st.caption("Eviction trend filter is active (use 'Clear Chart-Based Filters' in the sidebar to reset).")
 
-# --- CPI & Rent Index (FRED) ---
+# --- Zillow asking rent vs. LAHD reported rent owed ---
 with tab_cpi:
-    st.subheader("CPI (Rent Index) over eviction date range")
-    if cpi_df.empty:
-        st.info("CPI data could not be loaded from FRED.")
+    st.subheader("Monthly asking rent and reported rent owed")
+    st.caption(
+        "Zillow ZORI is the unweighted average typical asking rent across ZIP codes represented "
+        "by the current filters. LAHD rent owed is the average positive balance reported on each "
+        "matched notice. A notice balance may cover multiple months, so the two lines are contextually "
+        "related but are not equivalent rent measures."
+    )
+
+    positive_owed_records = df_rent_records[df_rent_records["Rent_Owed"] > 0].copy()
+    eligible_zips = sorted(
+        zip_code for zip_code in ev_filtered["Zip"].dropna().astype(str).unique()
+        if zip_code
+    )
+
+    if ev_filtered.empty:
+        st.info("No eviction records match the current filters.")
+    elif not eligible_zips or zori_zip.empty or not zori_month_columns:
+        st.info("No Zillow ZIP observations match the current filtered eviction records.")
     else:
-        date_min = ev_filtered["Date_Filed"].min()
-        date_max = ev_filtered["Date_Filed"].max()
-        sub_cpi = cpi_df[
-            (cpi_df["date"] >= date_min) & (cpi_df["date"] <= date_max)
+        comparison_start = ev_filtered["Date_Filed"].min().to_period("M").to_timestamp()
+        comparison_end = ev_filtered["Date_Filed"].max().to_period("M").to_timestamp()
+        comparison_months = pd.date_range(comparison_start, comparison_end, freq="MS")
+
+        zori_matrix = zori_zip.reindex(eligible_zips)[zori_month_columns].T
+        zori_matrix.index = pd.to_datetime(zori_matrix.index).to_period("M").to_timestamp()
+        zori_matrix = zori_matrix.loc[
+            (zori_matrix.index >= comparison_start)
+            & (zori_matrix.index <= comparison_end)
         ]
-        if sub_cpi.empty:
-            st.info("No CPI observations in this date range.")
+        zori_monthly = pd.DataFrame(
+            {
+                "month": zori_matrix.index,
+                "average_zori": zori_matrix.mean(axis=1, skipna=True).values,
+                "zori_zip_count": zori_matrix.count(axis=1).values,
+            }
+        )
+
+        if positive_owed_records.empty:
+            owed_monthly = pd.DataFrame(columns=["month", "average_rent_owed", "notice_count"])
         else:
-            fig = px.line(
-                sub_cpi,
-                x="date",
-                y="value",
-                markers=True,
-                labels={"date": "Date", "value": "CPI (Rent Index)"},
+            positive_owed_records["month"] = (
+                positive_owed_records["Date_Filed"].dt.to_period("M").dt.to_timestamp()
             )
-            
-            fig.update_traces(
-                mode="lines+markers+text",
-                text=sub_cpi["value"].round(1),
-                textposition="top center",
+            owed_monthly = (
+                positive_owed_records.groupby("month", as_index=False)
+                .agg(
+                    average_rent_owed=("Rent_Owed", "mean"),
+                    notice_count=("Rent_Owed", "size"),
+                )
+            )
+
+        rent_comparison = pd.DataFrame({"month": comparison_months})
+        rent_comparison = rent_comparison.merge(zori_monthly, on="month", how="left")
+        rent_comparison = rent_comparison.merge(owed_monthly, on="month", how="left")
+        rent_comparison["zori_zip_count"] = rent_comparison["zori_zip_count"].fillna(0).astype(int)
+        rent_comparison["notice_count"] = rent_comparison["notice_count"].fillna(0).astype(int)
+
+        if rent_comparison[["average_zori", "average_rent_owed"]].notna().sum().sum() == 0:
+            st.info("No Zillow or positive rent-owed observations fall in this filtered period.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=rent_comparison["month"],
+                    y=rent_comparison["average_zori"],
+                    mode="lines+markers",
+                    name="Average ZIP asking rent (ZORI)",
+                    line={"color": "#2563eb", "width": 3},
+                    marker={"size": 6},
+                    customdata=rent_comparison[["zori_zip_count"]].to_numpy(),
+                    hovertemplate=(
+                        "%{x|%B %Y}<br>Average ZORI: $%{y:,.0f}"
+                        "<br>ZIP observations: %{customdata[0]:,}<extra></extra>"
+                    ),
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=rent_comparison["month"],
+                    y=rent_comparison["average_rent_owed"],
+                    mode="lines+markers",
+                    name="Average reported rent owed per notice",
+                    line={"color": "#ea580c", "width": 3},
+                    marker={"size": 6},
+                    customdata=rent_comparison[["notice_count"]].to_numpy(),
+                    hovertemplate=(
+                        "%{x|%B %Y}<br>Average reported owed: $%{y:,.0f}"
+                        "<br>Positive-balance notices: %{customdata[0]:,}<extra></extra>"
+                    ),
+                )
+            )
+            fig.update_layout(
+                height=470,
+                margin=dict(l=40, r=20, t=30, b=40),
+                yaxis_title="USD",
+                yaxis_tickprefix="$",
+                yaxis_tickformat=",.0f",
+                hovermode="x unified",
+                legend={"orientation": "h", "y": 1.08, "x": 0},
+            )
+            st.plotly_chart(fig, width="stretch")
+            st.download_button(
+                "Download monthly rent comparison",
+                rent_comparison.to_csv(index=False),
+                "zillow_zori_vs_lahd_rent_owed.csv",
+                "text/csv",
+            )
+
+    with st.expander("CPI rent-index context", expanded=False):
+        st.caption(f"{FRED_SERIES_ID}: US city average rent of primary residence; index 1982–1984=100. Source: {cpi_source}. This is an index, not a dollar rent.")
+        for note in cpi_notes:
+            st.info(note)
+        if cpi_df.empty or ev_filtered.empty:
+            st.info("CPI data could not be loaded for this view.")
+        else:
+            date_min = ev_filtered["Date_Filed"].min()
+            date_max = ev_filtered["Date_Filed"].max()
+            sub_cpi = cpi_df[
+                (cpi_df["date"] >= date_min) & (cpi_df["date"] <= date_max)
+            ]
+            if sub_cpi.empty:
+                st.info("No CPI observations in this date range.")
+            else:
+                fig_cpi = px.line(
+                    sub_cpi,
+                    x="date",
+                    y="value",
+                    markers=True,
+                    labels={"date": "Date", "value": "CPI (Rent Index)"},
+                )
+                fig_cpi.update_layout(
+                    height=360,
+                    margin=dict(l=40, r=20, t=30, b=40),
+                    yaxis_title="CPI (Rent Index)",
+                    yaxis_tickformat=",.1f",
+                )
+                st.plotly_chart(fig_cpi, width="stretch")
+
+# --- Rent Owed Distribution (95% cutoff) ---
+with tab_hist:
+    st.subheader("Distribution of reported rent owed")
+    st.caption(
+        "The individualized histogram uses every LAHD notice with a positive rent-owed "
+        "amount; the top 5% are excluded. LAHD does not provide a verified unit "
+        "identifier, so records should not be interpreted as confirmed unique apartments."
+    )
+
+    df_rent_records = df_rent_records[df_rent_records["Rent_Owed"] > 0].copy()
+
+    if df_rent_records.empty:
+        st.info("No positive rent-owed values to display.")
+    else:
+        cutoff = float(df_rent_records["Rent_Owed"].quantile(0.95))
+        df_rent_trimmed = df_rent_records[
+            df_rent_records["Rent_Owed"] <= cutoff
+        ].copy()
+
+        metrics = st.columns(3)
+        metrics[0].metric("Notice records shown", f"{len(df_rent_trimmed):,}")
+        metrics[1].metric(
+            "Median reported rent owed",
+            f"${df_rent_trimmed['Rent_Owed'].median():,.0f}",
+        )
+        metrics[2].metric("95th-percentile cutoff", f"${cutoff:,.0f}")
+
+        distribution_view = st.radio(
+            "Distribution view",
+            [
+                "Density curve",
+                "Individual record marks",
+                "Address-date histogram",
+            ],
+            horizontal=True,
+        )
+
+        if distribution_view == "Density curve":
+            values = df_rent_trimmed["Rent_Owed"].to_numpy(dtype="float64")
+            sample_size = len(values)
+            standard_deviation = float(np.std(values, ddof=1))
+            q25, q75 = np.percentile(values, [25, 75])
+            robust_sigma = float((q75 - q25) / 1.349)
+            positive_scales = [
+                value
+                for value in [standard_deviation, robust_sigma]
+                if np.isfinite(value) and value > 0
+            ]
+            scale = min(positive_scales) if positive_scales else max(cutoff / 100, 1)
+            bandwidth = max(
+                0.9 * scale * sample_size ** (-1 / 5),
+                cutoff / 512,
+            )
+
+            counts, edges = np.histogram(values, bins=512, range=(0, cutoff))
+            centers = (edges[:-1] + edges[1:]) / 2
+            bin_width = edges[1] - edges[0]
+            sigma_bins = max(bandwidth / bin_width, 1.0)
+            radius = min(int(np.ceil(4 * sigma_bins)), 200)
+            kernel_axis = np.arange(-radius, radius + 1)
+            kernel = np.exp(-0.5 * (kernel_axis / sigma_bins) ** 2)
+            kernel /= kernel.sum()
+            density = np.convolve(counts, kernel, mode="same") / (
+                sample_size * bin_width
+            )
+
+            fig = go.Figure(
+                go.Scatter(
+                    x=centers,
+                    y=density,
+                    mode="lines",
+                    fill="tozeroy",
+                    line=dict(color="#2c5aa0", width=2.5),
+                    fillcolor="rgba(44, 90, 160, 0.18)",
+                    hovertemplate=(
+                        "<b>Reported rent owed: %{x:$,.0f}</b>"
+                        "<br>Estimated density: %{y:.3e}<extra></extra>"
+                    ),
+                )
+            )
+            median_rent = float(np.median(values))
+            mean_rent = float(np.mean(values))
+            fig.add_vline(
+                x=median_rent,
+                line_dash="dash",
+                line_color="#8c6d31",
+                annotation_text=f"Median ${median_rent:,.0f}",
+                annotation_position="top left",
+            )
+            fig.add_vline(
+                x=mean_rent,
+                line_dash="dot",
+                line_color="#756bb1",
+                annotation_text=f"Mean ${mean_rent:,.0f}",
+                annotation_position="top right",
             )
             fig.update_layout(
                 height=430,
-                margin=dict(l=40, r=20, t=60, b=40),
-                yaxis_title="CPI (Rent Index)",
-                yaxis_tickformat=",.1f",
+                margin=dict(l=75, r=25, t=45, b=65),
+                xaxis=dict(
+                    title="Reported rent owed per notice record",
+                    tickformat="$,.0f",
+                    rangemode="tozero",
+                    gridcolor="#e5e7eb",
+                ),
+                yaxis=dict(
+                    title="Estimated probability density",
+                    tickformat=".2e",
+                    rangemode="tozero",
+                    gridcolor="#e5e7eb",
+                ),
+                showlegend=False,
+                hoverlabel=dict(font_size=13),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
+            st.caption(
+                f"Gaussian kernel density estimate using all {sample_size:,} displayed "
+                f"notice records. Bandwidth: ${bandwidth:,.0f}, selected with a robust "
+                "Silverman rule. The same 95th-percentile cutoff and active filters apply."
+            )
 
-# --- Rent Owed Histogram (95% cutoff) ---
-with tab_hist:
-    st.subheader("Distribution of Rent Owed (excluding top 5% outliers)")
-    st.caption("Use Box Select in top right of the graph to filter for selected units")
-    df_hist = ev_filtered.copy()
-    df_hist = df_hist[df_hist["Total_Rent_Owed"] > 0]
+        elif distribution_view == "Individual record marks":
+            rent_values = np.ascontiguousarray(
+                df_rent_trimmed["Rent_Owed"].to_numpy(dtype="<f4")
+            )
+            encoded_values = base64.b64encode(rent_values.tobytes()).decode("ascii")
+            individualized_chart = """
+            <div id="rent-strip" style="font-family:system-ui,-apple-system,sans-serif;color:#273244">
+              <div style="font-size:13px;margin:0 0 6px 58px">
+                Each blue mark is one LAHD notice record
+              </div>
+              <canvas id="rent-canvas" role="img"
+                aria-label="Individual reported rent owed amounts with the highest five percent excluded"
+                style="display:block;width:100%;height:330px"></canvas>
+              <div style="text-align:center;font-size:13px;margin-top:6px">
+                Reported rent owed per notice record
+              </div>
+            </div>
+            <script>
+            (() => {
+              const canvas = document.getElementById("rent-canvas");
+              const ctx = canvas.getContext("2d");
+              const bytes = Uint8Array.from(atob("__VALUES__"), c => c.charCodeAt(0));
+              const values = new Float32Array(bytes.buffer);
+              const cutoff = __CUTOFF__;
+              const margins = {left: 58, right: 18, top: 16, bottom: 32};
 
-    if df_hist.empty:
-        st.info("No positive rent-owed values to display.")
-    else:
-        cutoff = df_hist["Total_Rent_Owed"].quantile(0.95)
-        df_hist = df_hist[df_hist["Total_Rent_Owed"] <= cutoff]
+              function money(value) {
+                return "$" + Math.round(value).toLocaleString("en-US");
+              }
 
-        fig = px.histogram(
-            df_hist,
-            x="Total_Rent_Owed",
-            nbins=40,
-            labels={"Total_Rent_Owed": "Total Rent Owed ($)"},
-        )
-        
-        fig.update_traces(
-            texttemplate="%{y}",
-            textposition="outside",
-        )
-        fig.update_layout(
-            height=430,
-            margin=dict(l=70, r=20, t=70, b=60),
-            xaxis_tickformat="$,.0f",
-            yaxis_title="Number of Separate Eviction Addresses",
-        )
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key="rent_hist_chart",
-            on_select=_update_rent_filter,
-            selection_mode="box",
-        )
-        if st.session_state.get("rent_filter") is not None:
-            st.caption("Rent owed histogram filter is active (use 'Clear Chart-Based Filters' in the sidebar to reset).")
+              function draw() {
+                const dpr = Math.max(1, window.devicePixelRatio || 1);
+                const width = Math.max(520, canvas.clientWidth);
+                const height = 330;
+                canvas.width = Math.floor(width * dpr);
+                canvas.height = Math.floor(height * dpr);
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                ctx.clearRect(0, 0, width, height);
 
-# --- Eviction Causes Pie ---
+                const plotWidth = width - margins.left - margins.right;
+                const plotHeight = height - margins.top - margins.bottom;
+
+                ctx.strokeStyle = "#e5e7eb";
+                ctx.fillStyle = "#4b5563";
+                ctx.font = "12px system-ui, sans-serif";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "top";
+                for (let tick = 0; tick <= 4; tick += 1) {
+                  const x = margins.left + plotWidth * tick / 4;
+                  ctx.beginPath();
+                  ctx.moveTo(x, margins.top);
+                  ctx.lineTo(x, margins.top + plotHeight);
+                  ctx.stroke();
+                  ctx.fillText(money(cutoff * tick / 4), x, margins.top + plotHeight + 8);
+                }
+
+                ctx.fillStyle = "#2c5aa0";
+                ctx.globalAlpha = 0.10;
+                for (let i = 0; i < values.length; i += 1) {
+                  const x = margins.left + (values[i] / cutoff) * plotWidth;
+                  const hash = Math.imul(i + 1, 2654435761) >>> 0;
+                  const y = margins.top + (hash / 4294967295) * plotHeight;
+                  ctx.fillRect(x, y, 1.5, 1.5);
+                }
+                ctx.globalAlpha = 1;
+
+                ctx.strokeStyle = "#9ca3af";
+                ctx.beginPath();
+                ctx.moveTo(margins.left, margins.top + plotHeight);
+                ctx.lineTo(width - margins.right, margins.top + plotHeight);
+                ctx.stroke();
+              }
+
+              new ResizeObserver(draw).observe(canvas);
+              draw();
+            })();
+            </script>
+            """
+            individualized_chart = individualized_chart.replace(
+                "__VALUES__", encoded_values
+            ).replace("__CUTOFF__", repr(cutoff))
+            components.html(individualized_chart, height=390)
+            st.caption(
+                "Every displayed notice is drawn as its own mark. Dense, darker areas "
+                "indicate many records with similar reported rent amounts; no buckets "
+                "or cumulative transformation are used."
+            )
+        else:
+            df_hist = ev_filtered[ev_filtered["Total_Rent_Owed"] > 0].copy()
+            node_cutoff = df_hist["Total_Rent_Owed"].quantile(0.95)
+            df_hist = df_hist[df_hist["Total_Rent_Owed"] <= node_cutoff]
+
+            fig = px.histogram(
+                df_hist,
+                x="Total_Rent_Owed",
+                nbins=40,
+                labels={"Total_Rent_Owed": "Total Rent Owed ($)"},
+            )
+            fig.update_traces(texttemplate="%{y}", textposition="outside")
+            fig.update_layout(
+                height=430,
+                margin=dict(l=70, r=20, t=70, b=60),
+                xaxis_tickformat="$,.0f",
+                yaxis_title="Address-date filing nodes",
+            )
+            st.plotly_chart(
+                fig,
+                width="stretch",
+                key="rent_hist_chart",
+                on_select=_update_rent_filter,
+                selection_mode="box",
+            )
+            if st.session_state.get("rent_filter") is not None:
+                st.caption(
+                    "Rent owed histogram filter is active (use Clear Chart-Based "
+                    "Filters in the sidebar to reset)."
+                )
+
+# --- Eviction Causes ---
 with tab_causes:
-    st.subheader("Eviction Cause Breakdown (filtered set)")
+    st.subheader("Eviction causes")
+    st.caption(
+        "Each address-date node appears once. Records listing more than one LAHD cause "
+        "are grouped as Multiple stated causes. Bars are ranked by affected tenants."
+    )
     df_causes = ev_filtered.copy()
-    df_causes = df_causes[
-        (df_causes["Cause"].notna()) & (df_causes["Cause"].str.strip() != "")
-    ]
 
     if df_causes.empty:
-        st.info("No non-empty Cause values to display.")
+        st.info("No cause records to display.")
     else:
         cause_sum = (
-            df_causes.groupby("Cause", as_index=False)["Eviction_Count"]
+            df_causes.groupby("Cause_Category", as_index=False)["Eviction_Count"]
             .sum()
             .rename(columns={"Eviction_Count": "total_evictions"})
             .sort_values("total_evictions", ascending=False)
         )
 
-        top_n = 9
-        if len(cause_sum) > top_n:
-            top = cause_sum.iloc[:top_n].copy()
-            other = cause_sum.iloc[top_n:].copy()
-            other_row = pd.DataFrame(
-                {
-                    "Cause": ["Other"],
-                    "total_evictions": [other["total_evictions"].sum()],
-                }
-            )
-            cause_sum = pd.concat([top, other_row], ignore_index=True)
-
-        fig = px.pie(
-            cause_sum,
-            names="Cause",
-            values="total_evictions",
-            hole=0.3,
+        chart_total = int(cause_sum["total_evictions"].sum())
+        cause_sum["share"] = cause_sum["total_evictions"] / chart_total
+        cause_sum["display_label"] = cause_sum.apply(
+            lambda row: f"{int(row['total_evictions']):,}  ({row['share']:.1%})",
+            axis=1,
         )
-        fig.update_traces(textposition="inside", textinfo="label+percent")
-        fig.update_layout(height=420, margin=dict(l=20, r=20, t=50, b=40))
-        st.plotly_chart(fig, use_container_width=True)
+        cause_sum = cause_sum.sort_values("total_evictions", ascending=True)
+
+        # Category names already identify each bar, so color is reserved for emphasis.
+        bar_colors = [
+            "#08519c" if category == "Non-payment of rent" else "#6baed6"
+            for category in cause_sum["Cause_Category"]
+        ]
+
+        fig = go.Figure(
+            go.Bar(
+                x=cause_sum["total_evictions"],
+                y=cause_sum["Cause_Category"],
+                orientation="h",
+                text=cause_sum["display_label"],
+                textposition="outside",
+                textfont=dict(size=13, color="#172033"),
+                cliponaxis=False,
+                marker_color=bar_colors,
+                customdata=cause_sum[["share"]],
+                hovertemplate=(
+                    "<b>%{y}</b><br>%{x:,.0f} affected tenants"
+                    "<br>%{customdata[0]:.1%} of filtered total<extra></extra>"
+                ),
+            )
+        )
+        fig.update_layout(
+            height=500,
+            margin=dict(l=190, r=135, t=20, b=60),
+            bargap=0.28,
+            showlegend=False,
+            xaxis_title="Affected tenants",
+            yaxis_title="",
+            xaxis_tickformat=",.0f",
+            xaxis=dict(gridcolor="#e5e7eb", tickfont=dict(size=12)),
+            yaxis=dict(tickfont=dict(size=13, color="#273244")),
+            hoverlabel=dict(font_size=13),
+        )
+        st.plotly_chart(fig, width="stretch")
+        st.caption(f"Filtered total: {chart_total:,} affected tenants.")
+
+        with st.expander("View detailed LAHD source terms"):
+            source_terms = (
+                df_causes[["Cause", "Eviction_Count"]]
+                .assign(Source_Term=df_causes["Cause"].map(split_cause_terms))
+                .explode("Source_Term")
+            )
+            source_terms = source_terms[source_terms["Source_Term"].notna()]
+            source_term_summary = (
+                source_terms.groupby("Source_Term", as_index=False)["Eviction_Count"]
+                .sum()
+                .rename(columns={"Eviction_Count": "Affected tenants mentioning term"})
+                .sort_values("Affected tenants mentioning term", ascending=False)
+            )
+            st.caption(
+                "A record with multiple stated causes appears under each applicable source term, "
+                "so this detail table is not a part-to-whole total."
+            )
+            st.dataframe(source_term_summary, hide_index=True, width="stretch")
 
 # --- Demographics (Census) ---
 with tab_demo:
     st.subheader("Neighborhood Demographic Based on Census Data (Irrespective of Evictions)")
+    with st.expander("What do these demographic columns mean?"):
+        st.markdown("`White_share`, `Black_share`, `Hispanic_share`, `Asian_share`, and `Other_share` are neighborhood population percentages: 4.7 means 4.7%, not 0.047%. They describe residents of the neighborhood, not tenants named in notices. In the supplied file the five columns sum to 100%. `Other_share` is the residual category outside the four named groups. The original Census variable crosswalk is not included, so its exact racial/ethnic membership and treatment of multiracial residents cannot be verified. Do not interpret it as other eviction causes or missing notice data.")
+        st.markdown("`median_income` and `median_rent` are supplied neighborhood dollar estimates. `rent_burden_pct` is a supplied percentage; its denominator and threshold require the original source documentation. The All Areas display is an unweighted average of neighborhoods, not a population-weighted Los Angeles estimate.")
 
     if census_df.empty:
         st.info(
@@ -1816,7 +2857,7 @@ with tab_demo:
         with cols_demo[0]:
             if "rent_burden_pct" in row:
                 st.metric(
-                    "Severely Rent-Burdened (≥50%) *paying over 50% of income on rent*",
+                    "Reported rent burden (source definition unverified)",
                     f"{row['rent_burden_pct']:.1f}%",
                 )
 
@@ -1854,6 +2895,421 @@ with tab_demo:
             )
             fig_demo.update_traces(textposition="inside", textinfo="label+percent")
             fig_demo.update_layout(height=360, margin=dict(l=20, r=20, t=60, b=40))
-            st.plotly_chart(fig_demo, use_container_width=True)
+            st.plotly_chart(fig_demo, width="stretch")
         else:
             st.info("No racial composition columns found in census file.")
+
+# ==============================
+# RESEARCH LAB — PROPERTY, PLACE, POLICY, AND EXPORTS
+# ==============================
+st.markdown("---")
+st.header("Research Lab")
+st.caption("Exploratory tools; correlations do not establish causation.")
+
+(
+    tab_property,
+    tab_routine,
+    tab_compare,
+    tab_hotspots,
+    tab_alerts,
+    tab_forecast,
+    tab_reports,
+    tab_method,
+    tab_admin,
+) = st.tabs(
+    [
+        "Property & parcel",
+        "Routine filers",
+        "Compare areas",
+        "Hotspots",
+        "Alerts & policy",
+        "Forecast",
+        "Reports & sharing",
+        "Methods & resources",
+        "Data admin",
+    ]
+)
+
+with tab_routine:
+    st.subheader("Routine and infrequent filing addresses")
+    st.caption("A retrospective comparison of notice activity, inspired by the supplied chart. Addresses are proxies for properties; these data do not identify verified landlords or completed evictions.")
+    routine_controls = st.columns(3)
+    threshold = routine_controls[0].number_input("Routine: minimum active months", min_value=2, max_value=36, value=6,
+        help="An address is routine if it has notices in at least this many distinct calendar months within the selected period. This is an adjustable research definition, not an official designation.")
+    period_label = routine_controls[1].selectbox("Group notices by", ["Year", "Month"])
+    measure_label = routine_controls[2].selectbox("Chart measure", ["Notice counts", "Share of notices (%)"])
+    routine_summary, routine_addresses = routine_filer_summary(ev_filtered, int(threshold), "Y" if period_label == "Year" else "M")
+    if routine_summary.empty:
+        st.info("No notice activity matches the current filters.")
+    else:
+        cohort_sizes = routine_addresses["cohort"].value_counts()
+        routine_counts = routine_addresses.groupby("cohort")["notices"].sum()
+        cards = st.columns(3)
+        cards[0].metric("Routine addresses", f"{cohort_sizes.get('Routine', 0):,}")
+        cards[1].metric("Infrequent addresses", f"{cohort_sizes.get('Infrequent', 0):,}")
+        cards[2].metric("Routine share of selected notices", f"{100 * routine_counts.get('Routine', 0) / routine_counts.sum():.1f}%")
+        measure = "notices" if measure_label == "Notice counts" else "share_percent"
+        figure = go.Figure()
+        for cohort, color, fill in [("Routine", "#eb4b00", "rgba(235,75,0,0.25)"), ("Infrequent", "#484b80", "rgba(72,75,128,0.25)")]:
+            series = routine_summary[routine_summary["cohort"].eq(cohort)]
+            figure.add_trace(go.Scatter(x=series["period"], y=series[measure], mode="lines+markers",
+                stackgroup="notices", name=f"{cohort} · {cohort_sizes.get(cohort, 0):,} addresses",
+                line={"color": color, "width": 3}, fillcolor=fill,
+                customdata=series[["notices", "share_percent"]].to_numpy(),
+                hovertemplate="%{x|%b %Y}<br>%{customdata[0]:,.0f} notices<br>%{customdata[1]:.1f}% of period notices<extra>%{fullData.name}</extra>"))
+        figure.update_layout(title=f"Contribution to notice volume by {period_label.lower()} — {selected_area}",
+            height=490, plot_bgcolor="#f4f6f8", paper_bgcolor="#f4f6f8",
+            font={"color": "#25292c"}, legend={"orientation": "h", "y": -0.22, "x": 0.5, "xanchor": "center"},
+            margin={"l": 45, "r": 25, "t": 70, "b": 100},
+            yaxis={"title": measure_label, "rangemode": "tozero", "gridcolor": "white"},
+            xaxis={"title": None, "tickformat": "%Y" if period_label == "Year" else "%b %Y"})
+        if measure == "share_percent":
+            figure.update_yaxes(range=[0, 100], ticksuffix="%")
+        st.plotly_chart(figure, width="stretch")
+        st.caption(f"Routine = notices in at least {threshold} separate months across the selected period. Cohort membership is fixed across this chart but recalculates when filters change. Orange is routine volume; the combined top boundary is total volume. First/last years may be partial. Counts are affected by property size and geocoding coverage. A true rate requires a compatible rental-unit or renter-household denominator.")
+        with st.expander("Explore routine addresses and download the calculation"):
+            st.dataframe(routine_addresses, hide_index=True, width="stretch")
+            st.download_button("Download routine/infrequent time series", routine_summary.to_csv(index=False), "routine_filing_contribution.csv", "text/csv")
+            st.download_button("Download address classifications", routine_addresses.to_csv(index=False), "routine_address_classifications.csv", "text/csv")
+
+with tab_property:
+    st.subheader("Address history and parcel profiles")
+    address_table = address_profiles(ev_filtered)
+    parcel_table = property_profiles(ev_filtered)
+    profile_mode = st.radio("Profile by", ["Address", "Parcel / APN"], horizontal=True)
+    if profile_mode == "Address":
+        choices = address_table["full_address"].tolist()
+        chosen = st.selectbox("Address", choices, index=0 if choices else None)
+        if chosen:
+            history = ev_filtered[ev_filtered["full_address"] == chosen].sort_values("Date_Filed")
+            profile = address_table[address_table["full_address"] == chosen].iloc[0]
+            cols = st.columns(4)
+            cols[0].metric("Filing dates", f"{int(profile['filing_nodes']):,}")
+            cols[1].metric("Notice records", f"{int(profile['affected_tenants']):,}")
+            cols[2].metric("Reported rent", f"${profile['total_rent_owed']:,.0f}")
+            cols[3].metric("APN(s)", profile["apns"][:24])
+            fig_history = px.bar(
+                history,
+                x="Date_Filed",
+                y="Eviction_Count",
+                color="Cause",
+                hover_data=["Total_Rent_Owed", "Apn"],
+                title="Filing timeline",
+            )
+            st.plotly_chart(fig_history, width="stretch")
+            st.dataframe(history[["Date_Filed", "Eviction_Count", "Cause", "Total_Rent_Owed", "Apn"]], width="stretch")
+    else:
+        apns = parcel_table["Apn"].tolist()
+        chosen_apn = st.selectbox("Parcel / APN", apns, index=0 if apns else None)
+        if chosen_apn:
+            parcel_rows = ev_filtered[ev_filtered["Apn"] == chosen_apn].sort_values("Date_Filed")
+            st.dataframe(parcel_rows[["full_address", "Date_Filed", "Eviction_Count", "Cause", "Total_Rent_Owed"]], width="stretch")
+
+    st.markdown("#### Optional ownership crosswalk")
+    st.caption("The eviction source does not contain verified owner names. Upload a CSV with `Apn` and `owner_name`; optional `network_name` links related LLCs.")
+    owner_file = st.file_uploader("Owner/APN crosswalk", type="csv", key="owner_crosswalk")
+    if owner_file is not None:
+        owner_map = pd.read_csv(owner_file, dtype=str)
+        if {"Apn", "owner_name"}.issubset(owner_map.columns):
+            ownership = ev_filtered.merge(owner_map, on="Apn", how="left")
+            group_field = "network_name" if "network_name" in ownership.columns else "owner_name"
+            owner_summary = (
+                ownership.dropna(subset=[group_field])
+                .groupby(group_field, as_index=False)
+                .agg(parcels=("Apn", "nunique"), addresses=("full_address", "nunique"), affected_tenants=("Eviction_Count", "sum"), rent_owed=("Total_Rent_Owed", "sum"))
+                .sort_values("affected_tenants", ascending=False)
+            )
+            st.dataframe(owner_summary, width="stretch")
+        else:
+            st.error("Crosswalk must contain `Apn` and `owner_name`.")
+
+with tab_compare:
+    st.subheader("Neighborhood comparison and normalized rates")
+    if nbhd.empty:
+        st.info("Neighborhood geometry is unavailable.")
+    else:
+        points = gpd.GeoDataFrame(
+            ev_filtered.copy(),
+            geometry=gpd.points_from_xy(ev_filtered["long"], ev_filtered["lat"]),
+            crs="EPSG:4326",
+        )
+        area_join = gpd.sjoin(points, nbhd[["name", "geometry"]], how="inner", predicate="within")
+        area_metrics = (
+            area_join.groupby("name", as_index=False)
+            .agg(evictions_total=("Eviction_Count", "sum"), filing_nodes=("full_address", "size"), unique_addresses=("full_address", "nunique"), rent_owed=("Total_Rent_Owed", "sum"))
+        )
+        if not census_df.empty:
+            area_metrics = area_metrics.merge(census_df, on="name", how="left")
+        denominators_file = st.file_uploader("Optional denominators CSV (`name`, `renter_households`)", type="csv", key="denominators")
+        if denominators_file is not None:
+            denominators = pd.read_csv(denominators_file)
+            if {"name", "renter_households"}.issubset(denominators.columns):
+                area_metrics = area_metrics.merge(denominators[["name", "renter_households"]], on="name", how="left")
+                area_metrics["notices_per_1000_renter_households"] = area_metrics["evictions_total"] / area_metrics["renter_households"] * 1000
+                rate_metric = "notices_per_1000_renter_households"
+            else:
+                st.error("Denominator file needs `name` and `renter_households`.")
+                rate_metric = "evictions_total"
+        else:
+            rate_metric = "evictions_total"
+            st.info("Upload renter-household denominators to calculate comparable rates per 1,000. Raw counts are shown until then.")
+        compare_names = st.multiselect("Choose 2–6 neighborhoods", sorted(area_metrics["name"].unique()), max_selections=6)
+        compare_df = area_metrics[area_metrics["name"].isin(compare_names)] if compare_names else area_metrics.nlargest(10, rate_metric)
+        fig_compare = px.bar(compare_df, x="name", y=rate_metric, color=rate_metric, color_continuous_scale="Blues")
+        st.plotly_chart(fig_compare, width="stretch")
+        st.dataframe(compare_df.sort_values(rate_metric, ascending=False), width="stretch")
+        corr = correlation_table(area_metrics)
+        if not corr.empty:
+            st.markdown("#### Demographic correlation explorer")
+            st.caption("Pearson correlations are descriptive, unadjusted, and not causal.")
+            with st.expander("How this correlation is calculated"):
+                st.markdown("Each observation is one neighborhood with matched, filtered notice activity. Pearson's r compares its total notice count with each numeric column. Missing pairs are omitted; the table reports the number of paired neighborhoods. At least three nonconstant pairs are required. Values range from −1 (opposite linear movement) to +1 (same-direction linear movement); 0 means no linear relationship. There is no legal or policy standard behind these scores, no significance test, no adjustment for multiple comparisons, and no control for population, rental stock, or other factors. Areas with no matched notices are absent from this comparison. Columns such as filing nodes and unique addresses overlap with the count itself and are not independent demographic explanations.")
+                st.latex(r"r=\frac{\sum_i(x_i-\bar{x})(y_i-\bar{y})}{\sqrt{\sum_i(x_i-\bar{x})^2\sum_i(y_i-\bar{y})^2}}")
+            st.dataframe(corr, width="stretch")
+
+with tab_hotspots:
+    st.subheader("Descriptive grid hotspots")
+    precision = st.slider("Grid precision", 2, 3, 2, help="2 ≈ 1 km cells; 3 ≈ 100 m cells.")
+    hotspots = grid_hotspots(ev_filtered, precision=precision)
+    if not hotspots.empty:
+        st.caption("Hotspot z-scores compare grid-cell counts with all cells in the filtered view; they are not spatial-significance tests.")
+        fig_hot = px.scatter_map(
+            hotspots,
+            lat="grid_lat",
+            lon="grid_long",
+            size="affected_tenants",
+            color="hotspot_z",
+            hover_data=["unique_addresses", "filing_nodes", "total_rent_owed"],
+            color_continuous_scale="RdBu_r",
+            zoom=9,
+            height=520,
+        )
+        fig_hot.update_layout(map_style="carto-positron")
+        st.plotly_chart(fig_hot, width="stretch")
+        st.dataframe(hotspots.head(50), width="stretch")
+
+with tab_alerts:
+    st.subheader("Trend anomalies and policy overlays")
+    window = st.slider("Baseline months", 2, 12, 3)
+    st.caption("Baseline = the mean of the previous selected number of calendar months, excluding the current month. A complete window is required. Alerts flag deviations of at least 2 sample standard deviations; this is a screening rule, not statistical proof or a policy standard. Gaps remain missing; incomplete or filtered months can distort comparisons.")
+    anomalies = anomaly_table(ev_filtered, window=window)
+    if not anomalies.empty:
+        fig_alert = px.line(anomalies, x="month", y=["evictions", "baseline"], markers=True)
+        flagged = anomalies[anomalies["is_alert"]]
+        if not flagged.empty:
+            fig_alert.add_scatter(x=flagged["month"], y=flagged["evictions"], mode="markers", marker={"size": 14, "color": "red"}, name="±2 SD alert")
+        policy_file = st.file_uploader("Optional policy timeline CSV (`date`, `label`)", type="csv", key="policy_timeline")
+        if policy_file is not None:
+            policy = pd.read_csv(policy_file)
+            if {"date", "label"}.issubset(policy.columns):
+                policy["date"] = pd.to_datetime(policy["date"], errors="coerce")
+                for event in policy.dropna(subset=["date"]).itertuples():
+                    fig_alert.add_vline(x=event.date.timestamp() * 1000, line_dash="dot", annotation_text=str(event.label)[:40])
+            else:
+                st.error("Policy timeline needs `date` and `label`.")
+        st.plotly_chart(fig_alert, width="stretch")
+        st.dataframe(anomalies.sort_values("z_score", key=abs, ascending=False).head(20), width="stretch")
+    search_definition = {
+        "area": selected_area,
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "causes": selected_causes,
+        "districts": selected_districts,
+        "zips": selected_zips,
+        "zori_month": selected_zori_month,
+        "apn": apn_query,
+        "address": address_query,
+        "minimum_repeat_filings": repeat_min,
+    }
+    st.download_button("Save search / alert definition", json.dumps(search_definition, indent=2), "evictorbookla_saved_search.json", "application/json")
+    st.caption("Automated email/SMS delivery requires a scheduler and messaging backend; this export is ready for one.")
+
+with tab_forecast:
+    st.subheader("Short-term filing forecast")
+    horizon = st.slider("Forecast months", 3, 18, 6)
+    forecast, diagnostics = forecast_monthly(ev_filtered, months=horizon)
+    if forecast.empty:
+        st.info(diagnostics.get("method", "At least four months of history are required."))
+    else:
+        historic = anomaly_table(ev_filtered)[["month", "evictions"]]
+        fig_forecast = go.Figure()
+        fig_forecast.add_scatter(x=historic["month"], y=historic["evictions"], mode="lines+markers", name="Observed")
+        fig_forecast.add_scatter(x=forecast["month"], y=forecast["upper"], mode="lines", line={"width": 0}, showlegend=False)
+        fig_forecast.add_scatter(x=forecast["month"], y=forecast["lower"], mode="lines", fill="tonexty", fillcolor="rgba(59,111,182,0.12)", line={"width": 0}, name="95% prediction interval (future count)")
+        fig_forecast.add_scatter(x=forecast["month"], y=forecast["ci_upper_95"], mode="lines", line={"width": 0}, showlegend=False)
+        fig_forecast.add_scatter(x=forecast["month"], y=forecast["ci_lower_95"], mode="lines", fill="tonexty", fillcolor="rgba(59,111,182,0.30)", line={"width": 0}, name="95% confidence interval (mean count)")
+        fig_forecast.add_scatter(x=forecast["month"], y=forecast["forecast"], mode="lines+markers", name="Linear baseline",
+                                customdata=forecast[["ci_lower_95", "ci_upper_95", "lower", "upper"]],
+                                hovertemplate="%{x|%b %Y}<br>Forecast: %{y:,.0f}<br>95% mean CI: %{customdata[0]:,.0f}–%{customdata[1]:,.0f}<br>95% prediction interval: %{customdata[2]:,.0f}–%{customdata[3]:,.0f}<extra></extra>")
+        st.plotly_chart(fig_forecast, width="stretch")
+        st.metric("Holdout mean absolute error", f"{diagnostics['mae']:.1f} notices")
+        st.warning("This is a transparent planning baseline, not a causal forecast. Sudden policy or reporting changes are not modeled.")
+        st.caption("The darker 95% confidence band estimates the mean monthly count; the wider 95% prediction band allows for variation in a future monthly count. Both use OLS residual variance, forecast leverage, and a Student-t critical value with n−2 degrees of freedom. They assume a correct linear trend and independent, normally distributed errors with constant variance. Serial correlation, seasonality, incomplete months, reporting delays and policy changes can invalidate coverage. Negative values are truncated at zero; nominal 95% coverage has not been independently validated.")
+        with st.expander("Monthly forecasts and intervals"):
+            displayed_forecast = forecast.rename(columns={"forecast":"Forecast notices", "ci_lower_95":"95% mean CI lower", "ci_upper_95":"95% mean CI upper", "lower":"95% prediction lower", "upper":"95% prediction upper"})
+            st.dataframe(displayed_forecast, hide_index=True, width="stretch")
+            exported_forecast = displayed_forecast.assign(confidence_level=.95, interval_method="OLS Student-t, iid normal errors; count bounds truncated at zero")
+            st.download_button("Download monthly forecasts with intervals", exported_forecast.to_csv(index=False), "monthly_notice_forecasts.csv", "text/csv")
+
+with tab_reports:
+    st.subheader("Share, export, and print")
+    report_bytes = report_html(ev_filtered, selected_area, f"{start_date} to {end_date}")
+    col_a, col_b, col_c = st.columns(3)
+    col_a.download_button("Printable report (HTML/PDF)", report_bytes, "evictorbookla_report.html", "text/html")
+    col_b.download_button("Filtered GeoJSON", selection_geojson(ev_filtered), "evictorbookla_filtered.geojson", "application/geo+json")
+    col_c.download_button("Filtered CSV", ev_filtered.to_csv(index=False), "evictorbookla_filtered.csv", "text/csv")
+    share_state = json.dumps(search_definition)
+    components.html(
+        f"""<button id='copy-view' style='padding:8px 12px'>Copy shareable view URL</button>
+        <span id='copy-status' aria-live='polite'></span><script>
+        document.getElementById('copy-view').onclick = async () => {{
+          const url = new URL(window.parent.location.href);
+          url.searchParams.set('view', btoa(unescape(encodeURIComponent(JSON.stringify({share_state})))));
+          await navigator.clipboard.writeText(url.toString());
+          document.getElementById('copy-status').textContent = ' Copied';
+        }};</script>""",
+        height=45,
+    )
+    st.caption("The URL stores the current filter definition. Polygon IDs remain in the existing `sel` parameter.")
+    st.markdown("#### Embed")
+    st.code('<iframe src="YOUR_DEPLOYED_APP_URL/?embed=true" width="100%" height="900" loading="lazy" title="EvictorBookLA Atlas map"></iframe>', language="html")
+
+with tab_method:
+    try:
+        st.page_link("math_page.py", label="All ALPHA and BETA mathematical methods", icon="📐")
+    except st.errors.StreamlitAPIException:
+        # The original app.py entry point has no multipage navigation registry.
+        # Keep the complete reference accessible when ALPHA runs standalone.
+        with st.expander("All ALPHA and BETA mathematical methods"):
+            from methods_ui import render_mathematical_methods
+            render_mathematical_methods()
+    st.subheader("Definitions, provenance, limitations, and tenant resources")
+    with st.expander("Full metric guide and data dictionary"):
+        guide = Path(__file__).with_name("ANALYTICS_GUIDE.md")
+        if guide.exists():
+            st.markdown(guide.read_text())
+    coverage_start = evictions["Date_Filed"].min().date()
+    coverage_end = evictions["Date_Filed"].max().date()
+    source_rows = len(pd.read_csv(EVICTION_CSV, usecols=["row_id"]))
+    zori_coverage = (
+        f"{pd.to_datetime(zori_month_columns[0]).strftime('%B %Y')} to "
+        f"{pd.to_datetime(zori_month_columns[-1]).strftime('%B %Y')}"
+        if zori_month_columns
+        else "Unavailable"
+    )
+    quality = pd.DataFrame(
+        {
+            "Item": [
+                "Eviction source",
+                "Eviction coverage",
+                "Raw eviction rows",
+                "Mapped address-date nodes",
+                "Missing coordinates after cleaning",
+                "Eviction file update",
+                "Asking-rent source",
+                "ZORI coverage",
+                "ZIP overlay geometry",
+            ],
+            "Value": [
+                "Los Angeles Housing Department eviction notices",
+                f"{coverage_start} to {coverage_end}",
+                f"{source_rows:,}",
+                f"{len(evictions):,}",
+                "Excluded from mapped analysis",
+                pd.Timestamp(os.path.getmtime(EVICTION_CSV), unit="s").strftime("%Y-%m-%d %H:%M"),
+                "Zillow Observed Rent Index (ZIP-level, smoothed)",
+                zori_coverage,
+                "U.S. Census Bureau 2020 generalized ZCTAs",
+            ],
+        }
+    )
+    st.dataframe(quality, hide_index=True, width="stretch")
+    with st.expander("Monthly source coverage — including unmapped notices", expanded=True):
+        coverage_raw = pd.read_csv(EVICTION_CSV, usecols=["Date Received", "lat", "long"])
+        coverage_raw["month"] = pd.to_datetime(coverage_raw["Date Received"], format="mixed", errors="coerce").dt.to_period("M").dt.to_timestamp()
+        coverage_raw["mapped"] = coverage_raw[["lat", "long"]].notna().all(axis=1)
+        coverage = coverage_raw.groupby("month").agg(source_notices=("mapped", "size"), mapped_notices=("mapped", "sum"))
+        if not coverage.empty:
+            coverage = coverage.reindex(pd.date_range(coverage.index.min(), coverage.index.max(), freq="MS")).rename_axis("month").reset_index()
+            coverage["unmapped_notices"] = coverage["source_notices"] - coverage["mapped_notices"]
+            coverage["mapped_percent"] = 100 * coverage["mapped_notices"] / coverage["source_notices"]
+            st.plotly_chart(px.line(coverage, x="month", y=["source_notices", "mapped_notices"], markers=True), width="stretch")
+            st.dataframe(coverage, hide_index=True, width="stretch")
+            st.download_button("Download monthly coverage", coverage.to_csv(index=False), "lahd_monthly_coverage.csv", "text/csv")
+        st.caption("All locally imported LAHD notices by Date Received, independent of map filters. Missing coordinates reduce mapped counts; they do not remove records from this source-coverage view. An absent month is shown as missing, never invented or interpolated. The latest month may be incomplete.")
+    if METADATA_PATH.exists():
+        refresh_meta = json.loads(METADATA_PATH.read_text())
+        st.markdown("#### Live-source status")
+        status_cols = st.columns(4)
+        status_cols[0].metric("Last checked", pd.to_datetime(refresh_meta.get("checked_at") or refresh_meta["refreshed_at"]).strftime("%Y-%m-%d %H:%M UTC"))
+        status_cols[1].metric("Latest notice received", refresh_meta["checks"]["latest_received"])
+        status_cols[2].metric("Source rows", f"{refresh_meta['checks']['rows']:,}")
+        status_cols[3].metric("Mapped rows", f"{refresh_meta['checks']['mapped_percent']:.1f}%")
+        st.caption(f"Published file timestamp: {refresh_meta['source_csv'].get('last_modified') or 'not supplied'}")
+    st.markdown(
+        """
+        **Core definitions.** A filing node is one address-date combination. `Date_Filed` is LAHD's Date Received. `Eviction_Count` and legacy “Affected tenants” fields count notice records, not people or completed evictions. `Total_Rent_Owed` sums reported amounts within a node; these amounts are not independently verified. Repeat filing counts are filing dates per address. APN identifies a parcel, not a verified owner. Zillow ZORI estimates typical market asking rent for a ZIP area; it is not a tenant's contract rent.
+
+        **Rent comparison math.** For month *t*, average asking rent is the arithmetic mean of available ZORI values across ZIP codes represented by the active eviction filters: `mean(ZORI_zip,t)`. Average rent owed is the arithmetic mean of positive LAHD `Rent Owed` values on matched notice records filed in month *t*. Missing Zillow ZIP-month observations remain missing and are not converted to zero. The ZORI aggregation is unweighted because the supplied file does not include rental-stock weights.
+
+        **Monthly forecast uncertainty.** Ordinary least squares fits notice count to month index. For n months, residual variance is `s² = SSE / (n−2)` and future leverage is `h = 1/n + (x−mean(x))² / sum((x−mean(x))²)`. The pointwise 95% confidence interval for the mean is `forecast ± t(.975,n−2) × sqrt(s²h)`; the wider 95% prediction interval for a future count is `forecast ± t(.975,n−2) × sqrt(s²(1+h))`. Bounds are truncated at zero. Coverage assumes independent, normal, constant-variance errors and an adequate linear trend; real-world 95% coverage has not been verified. See BETA's Methods for separate address-probability intervals.
+
+        **Map method.** The asking-rent overlay joins the selected ZORI month to 2020 Census ZIP Code Tabulation Area (ZCTA) polygons by five-digit code. The color scale uses the 10th to 90th percentile of visible ZIP values so high-rent outliers do not flatten the rest of the map; hover details retain the exact value. ZCTAs approximate ZIP service areas and are not USPS delivery-route boundaries.
+
+        **Important limitations.** Notices are not court judgments or proof that a household physically moved. Address geocoding, duplicate records, missing notices, boundary assignment, and changing reporting practices can affect results. Owner analysis requires an external verified APN crosswalk. Neighborhood rates require renter-household denominators.
+
+        **Data sources.** [Zillow Research ZORI data](https://www.zillow.com/research/data/) · [Census ZCTA definitions](https://www.census.gov/programs-surveys/geography/guidance/geo-areas/zctas.html) · [Census TIGERweb boundary service](https://tigerweb.geo.census.gov/arcgis/rest/services/Generalized_TAB2020/PUMA_TAD_TAZ_UGA_ZCTA/MapServer/3)
+
+        **Tenant resources.** [LAHD renter resources](https://housing.lacity.gov/residents/renters) · [Stay Housed LA](https://www.stayhousedla.org/) · [211 LA](https://211la.org/)
+        """
+    )
+
+with tab_admin:
+    st.subheader("LAHD live-data refresh")
+    st.markdown(f"Source: [LAHD published eviction CSV]({SOURCE_CSV})")
+    st.caption("While this dashboard is open, an hourly timer checks whether the 24-hour refresh interval has elapsed. CSV and Excel source files are accepted. Closing the app stops these checks. Set `LAHD_AUTO_REFRESH_HOURS=0` to disable or another number to change the interval.")
+    refresh_cols = st.columns(2)
+    if refresh_cols[0].button("Check source now", type="secondary"):
+        try:
+            with st.spinner("Downloading and validating LAHD data…"):
+                check_result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=True, geocode=False)
+            if check_result.get("status") == "retained_newer_local_data":
+                st.info(check_result["message"])
+            else:
+                st.success("Source passed validation; no local files were changed.")
+            st.json(check_result)
+        except Exception as error:
+            st.error(f"Source check failed; saved data retained. {error}")
+    if refresh_cols[1].button("Update from LAHD now", type="primary"):
+        try:
+            with st.spinner("Updating from LAHD and preserving a rollback copy…"):
+                update_result = refresh_lahd_data(Path(EVICTION_CSV), dry_run=False, geocode=False)
+            st.cache_data.clear()
+            if update_result.get("status") == "retained_newer_local_data":
+                st.info(update_result["message"])
+            else:
+                st.success(f"Updated to {update_result['checks']['latest_received']} with {update_result['checks']['rows']:,} rows.")
+            st.rerun()
+        except Exception as error:
+            st.error(f"Refresh failed; saved data retained. {error}")
+    st.info("The direct LAHD CSV does not include coordinates. Existing address/APN coordinates and the geocode cache are reused; unmatched records remain in the source file but are excluded from map-only analysis.")
+
+    st.markdown("#### Validate a manually downloaded dataset")
+    upload = st.file_uploader("Upload CSV for validation", type="csv", key="data_refresh")
+    if upload is not None:
+        candidate = pd.read_csv(upload)
+        required = {"full_address", "lat", "long", "Date Received", "Cause", "Apn", "Council District", "Rent Owed"}
+        missing = sorted(required - set(candidate.columns))
+        checks = {
+            "Rows": len(candidate),
+            "Columns": len(candidate.columns),
+            "Missing required columns": ", ".join(missing) or "None",
+            "Missing coordinates": int(candidate[["lat", "long"]].isna().any(axis=1).sum()) if {"lat", "long"}.issubset(candidate.columns) else "N/A",
+            "Duplicate rows": int(candidate.duplicated().sum()),
+        }
+        st.json(checks)
+        if not missing:
+            st.success("Schema validation passed. Review the preview before replacing the production file.")
+            st.dataframe(candidate.head(100), width="stretch")
+        else:
+            st.error("Schema validation failed; the production file was not changed.")

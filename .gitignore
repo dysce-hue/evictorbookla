@@ -1,0 +1,10 @@
+.streamlit/secrets.toml
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+data/*.previous.csv
+data/*.next.csv
+data/geocode_cache.csv
+data/refresh_metadata.json

@@ -1,9 +1,11 @@
-streamlit
+streamlit>=1.46
 pandas
 numpy
+scipy
 geopandas
 requests
 plotly
-pyproj
+pyproj<3.7.2
 shapely
 rtree
+openpyxl
