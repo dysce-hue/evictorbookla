@@ -9,7 +9,7 @@ import pandas as pd
 import geopandas as gpd
 import requests
 import streamlit as st
-from ui_helpers import embed_html, readable_timeline, readable_neighborhoods
+from ui_helpers import embed_html, readable_neighborhoods, address_timeline, routine_chart
 import plotly.express as px
 import plotly.graph_objects as go
 from fred_data import fetch_rent_cpi, RENT_SERIES
@@ -556,6 +556,8 @@ def refresh_status():
 refresh_status()
 
 evictions = load_evictions(EVICTION_CSV, os.path.getmtime(EVICTION_CSV))
+if not evictions.empty:
+    st.caption(f"Loaded mapped notice history: {evictions['Date_Filed'].min():%b %d, %Y} through {evictions['Date_Filed'].max():%b %d, %Y}. These are observed data dates, not a claim that today's reporting is complete.")
 if os.path.exists(ZORI_ZIP_CSV):
     zori_zip, zori_month_columns = load_zori_zip(
         ZORI_ZIP_CSV,
@@ -2994,24 +2996,10 @@ with tab_routine:
             cards[1].metric("Infrequent addresses", f"{cohort_sizes.get('Infrequent', 0):,}")
             cards[2].metric("Routine share of selected notices", f"{100 * routine_counts.get('Routine', 0) / routine_counts.sum():.1f}%")
             measure = "notices" if measure_label == "Notice counts" else "share_percent"
-            figure = go.Figure()
-            for cohort, color, fill in [("Routine", "#eb4b00", "rgba(235,75,0,0.25)"), ("Infrequent", "#484b80", "rgba(72,75,128,0.25)")]:
-                series = routine_summary[routine_summary["cohort"].eq(cohort)]
-                figure.add_trace(go.Scatter(x=series["period"], y=series[measure], mode="lines+markers",
-                    stackgroup="notices", name=f"{cohort} · {cohort_sizes.get(cohort, 0):,} addresses",
-                    line={"color": color, "width": 3}, fillcolor=fill,
-                    customdata=series[["notices", "share_percent"]].to_numpy(),
-                    hovertemplate="%{x|%b %Y}<br>%{customdata[0]:,.0f} notices<br>%{customdata[1]:.1f}% of period notices<extra>%{fullData.name}</extra>"))
-            figure.update_layout(title=f"Contribution to notice volume by {period_label.lower()} — {selected_area}",
-                height=490, plot_bgcolor="#f4f6f8", paper_bgcolor="#f4f6f8",
-                font={"color": "#25292c"}, legend={"orientation": "h", "y": -0.22, "x": 0.5, "xanchor": "center"},
-                margin={"l": 45, "r": 25, "t": 70, "b": 100},
-                yaxis={"title": measure_label, "rangemode": "tozero", "gridcolor": "white"},
-                xaxis={"title": None, "tickformat": "%Y" if period_label == "Year" else "%b %Y"})
-            if measure == "share_percent":
-                figure.update_yaxes(range=[0, 100], ticksuffix="%")
+            figure = routine_chart(routine_summary, cohort_sizes, share=measure == "share_percent",
+                                   yearly=period_label == "Year", area=selected_area)
             st.plotly_chart(figure, width="stretch")
-            st.caption(f"Routine = notices in at least {threshold} separate months across the selected period. Cohort membership is fixed across this chart but recalculates when filters change. Orange is routine volume; the combined top boundary is total volume. First/last years may be partial. Counts are affected by property size and geocoding coverage. A true rate requires a compatible rental-unit or renter-household denominator.")
+            st.caption(f"Routine = notices in at least {threshold} separate months across the selected period. Cohort membership is fixed across this chart but recalculates when filters change. Share mode shows each cohort's own percentage; count mode stacks the two groups. The summary card is notice-weighted across all selected periods, not the average annual share. First/last years may be partial. Counts are affected by property size and geocoding coverage; these are not eviction rates.")
             with st.expander("Explore routine addresses and download the calculation"):
                 st.dataframe(routine_addresses, hide_index=True, width="stretch")
                 st.download_button("Download routine/infrequent time series", routine_summary.to_csv(index=False), "routine_filing_contribution.csv", "text/csv")
@@ -3034,17 +3022,9 @@ with tab_property:
                 cols[1].metric("Notice records", f"{int(profile['affected_tenants']):,}")
                 cols[2].metric("Reported rent", f"${profile['total_rent_owed']:,.0f}")
                 cols[3].metric("APN(s)", profile["apns"][:24])
-                fig_history = px.bar(
-                    history,
-                    x="Date_Filed",
-                    y="Eviction_Count",
-                    color="Cause_Category",
-                    hover_data=["Total_Rent_Owed", "Apn"],
-                    title="Reported-notice timeline",
-                    labels={"Date_Filed": "Date received", "Eviction_Count": "Notice records",
-                            "Cause_Category": "Cause category", "Total_Rent_Owed": "Reported rent owed ($)"},
-                )
-                st.plotly_chart(readable_timeline(fig_history), width="stretch")
+                timeline_group = st.radio("Timeline grouping", ["Month", "Day"], horizontal=True)
+                st.plotly_chart(address_timeline(history, monthly=timeline_group == "Month"), width="stretch")
+                st.caption(f"This address has recorded activity from {history['Date_Filed'].min():%b %d, %Y} to {history['Date_Filed'].max():%b %d, %Y} within your filters. A shorter address history does not establish a gap in the full dataset.")
                 st.dataframe(history[["Date_Filed", "Eviction_Count", "Cause", "Total_Rent_Owed", "Apn"]], width="stretch")
         else:
             apns = parcel_table["Apn"].tolist()
@@ -3116,7 +3096,10 @@ with tab_compare:
                 with st.expander("How this correlation is calculated"):
                     st.markdown("Each observation is one neighborhood with matched, filtered notice activity. Pearson's r compares its total notice count with each numeric column. Missing pairs are omitted; the table reports the number of paired neighborhoods. At least three nonconstant pairs are required. Values range from −1 (opposite linear movement) to +1 (same-direction linear movement); 0 means no linear relationship. There is no legal or policy standard behind these scores, no significance test, no adjustment for multiple comparisons, and no control for population, rental stock, or other factors. Areas with no matched notices are absent from this comparison. Columns such as filing nodes and unique addresses overlap with the count itself and are not independent demographic explanations.")
                     st.latex(r"r=\frac{\sum_i(x_i-\bar{x})(y_i-\bar{y})}{\sqrt{\sum_i(x_i-\bar{x})^2\sum_i(y_i-\bar{y})^2}}")
-                st.dataframe(corr, width="stretch")
+                corr_display = corr.copy()
+                corr_display["metric"] = corr_display["metric"].replace({"unique_addresses": "Unique addresses with notices"})
+                st.dataframe(corr_display, hide_index=True, width="stretch")
+                st.caption("Unique addresses with notices counts distinct address labels in each neighborhood within the current filters—not rental units, owners, or all neighborhood addresses. Its correlation with notice count partly reflects neighborhood size and exposure. Table row numbers are not correlation values.")
 
 with tab_hotspots:
     if tab_hotspots.open:
