@@ -1,0 +1,20 @@
+{
+  "model_version": "temporal-xgboost-v5-rolling-brier-ci95",
+  "source": "data/cleaned_evictions_final.csv",
+  "source_records": 309010,
+  "source_end": "2026-09-28",
+  "target": "At least one reported LAHD notice in the next 90 days; not completed eviction",
+  "eligibility": "Address observed with a notice in preceding 365 days",
+  "selection_origins": ["2025-10-03", "2026-01-01", "2026-04-01"],
+  "selection_rule": "Equal-period mean Brier minimized, with mean AP and top-decile precision no lower than eligible ridge",
+  "selected_parameters": {"family": "xgboost", "calibration": "brier", "depth": 4, "penalty": 30.0, "child": 30},
+  "selected_validation_means": {"brier_score": 0.12173089291062693, "average_precision": 0.6563494214942043, "precision_top_10": 0.7974837553723125},
+  "evaluation_origin": "2026-06-30",
+  "evaluation_addresses": 16069,
+  "evaluation_outcomes": ["2026-07-01", "2026-09-28"],
+  "selected_evaluation": {"brier_score": 0.1227363440320552, "average_precision": 0.6460152323216228, "event_rate": 0.222415831725683, "log_loss": 0.3967979335456074, "precision_top_10": 0.7971248988736076},
+  "previous_fixed_xgboost_evaluation": {"brier_score": 0.12290627852882646, "average_precision": 0.6448580200342436, "event_rate": 0.222415831725683, "log_loss": 0.397262489187825, "precision_top_10": 0.7959424979774721},
+  "blend_experiment": {"ridge_weights": [0, 0.1, 0.25, 0.5, 1], "best_mean_brier": 0.12172167749321507, "retained": false, "reason": "Additional reduction below 0.00001 on validation; not established meaningful and adds interval/explanation complexity"},
+  "reproduce": "prepare_notices(pandas.read_csv(source, low_memory=False)); predictive_building_forecast(prepared). Model performance exports comparison and per-period validation scores.",
+  "limits": ["Latest evaluation period was inspected during prior development; not a fresh prospective test", "Small gains, with no demonstrated statistical significance", "Top-decile precision slightly decreased in one earlier period; mean improved", "Publication-time backfills are not observable", "Approximate 95% intervals use 30 whole-address bootstrap refits, conditional on fixed model selection", "No proof of global optimality or future accuracy"]
+}

@@ -21,8 +21,12 @@ class XGBoostTests(unittest.TestCase):
     def test_forced_xgboost_path_and_intervals(self):
         def metric(error, ap):
             return dict(brier_score=error, average_precision=ap, event_rate=.5)
-        metrics = [metric(.20, .7)] + [metric(.15, .8)] * 3 + [metric(.10, .9)] * 3
-        metrics += [metric(.20, .7), metric(.15, .8), metric(.10, .9)]
+        data = fixture()
+        cutoffs = pd.date_range(data.Date_Filed.max().normalize()-pd.Timedelta(days=90),
+                               data.Date_Filed.min().normalize()+pd.Timedelta(days=365), freq="-90D")
+        folds = min(3, len(cutoffs)-3)
+        metrics = [metric(.20, .7)] * folds + [metric(.15, .8)] * (3*folds) + [metric(.10, .9)] * (2*len(xf.XGB_CONFIGS)*folds)
+        metrics += [metric(.20, .7), metric(.15, .8), metric(.10, .9), metric(.11, .89)]
         with patch.object(pm, "_model_metrics", side_effect=metrics):
             result = pm.predictive_building_forecast(fixture())
         self.assertEqual(result["metadata"]["selected_family"], "xgboost")
@@ -31,9 +35,16 @@ class XGBoostTests(unittest.TestCase):
         self.assertTrue(np.isfinite(forecast[["forecast_probability", "ci_lower_95", "ci_upper_95"]]).all().all())
         self.assertTrue(forecast.ci_lower_95.le(forecast.forecast_probability).all())
         self.assertTrue(forecast.ci_upper_95.ge(forecast.forecast_probability).all())
-        self.assertEqual(len(result["model_comparison"]), 3)
+        self.assertEqual(len(result["model_comparison"]), 4)
         self.assertFalse(result["feature_importance"].empty)
         self.assertTrue(result["coefficients"].empty)
+
+    def test_precision_ties_and_brier_calibration(self):
+        score = xf._metrics(np.array([1, 0, 1, 0]), np.full(4, .5))
+        self.assertEqual(score["precision_top_10"], .5)
+        a, b = xf._fit_platt(np.linspace(-2, 2, 8), [0, 0, 1, 0, 1, 1, 1, 1], objective="brier")
+        self.assertGreaterEqual(a, 0)
+        self.assertTrue(np.isfinite([a, b]).all())
 
     def test_final_outcomes_do_not_select_model(self):
         data = fixture()

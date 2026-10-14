@@ -8,7 +8,7 @@ import pandas as pd
 
 FORECAST_HORIZON_DAYS = 90
 FORECAST_LOOKBACK_DAYS = 365
-FORECAST_MODEL_VERSION = "temporal-xgboost-v4-calibrated-ci95"
+FORECAST_MODEL_VERSION = "temporal-xgboost-v5-rolling-brier-ci95"
 
 FORECAST_FEATURES = [
     "log_notices_30",

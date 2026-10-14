@@ -79,24 +79,28 @@ def render_forecast(result, eligible_addresses, records, inspector):
         if meta.get("xgboost_status"):
             st.caption(meta["xgboost_status"])
         if meta["promotion_gate_passed"]:
-            st.success("Enhanced model selected on an earlier validation period. The later test below was not used to choose it.")
+            st.success("Enhanced model selected using earlier rolling validation periods. The latest evaluation below was not used by this selection procedure.")
         else:
             st.info("The enhanced candidate did not improve both selection metrics. The simpler baseline is serving forecasts.")
         cards = st.columns(3)
-        cards[0].metric("Test probability error", f"{served['brier_score']:.3f}", help="Brier score: average squared error between probability and outcome. Lower is better; not an accuracy percentage.")
-        cards[1].metric("Test ranking score", f"{served['average_precision']:.3f}", help="Average precision summarizes the precision–recall curve. Higher is better; not a percentage correctly predicted.")
+        cards[0].metric("Test probability error", f"{served['brier_score']:.5f}", help="Brier score: average squared error between probability and outcome. Lower is better; not an accuracy percentage.")
+        cards[1].metric("Test ranking score", f"{served['average_precision']:.4f}", help="Average precision summarizes the precision–recall curve. Higher is better; not a percentage correctly predicted.")
         cards[2].metric("Test addresses", f"{meta['holdout_addresses']:,}")
+        if "precision_top_10" in served:
+            st.metric("Precision among highest-risk 10%", f"{served['precision_top_10']:.1%}", help="Fraction of the highest-scored 10% of eligible test addresses with a new notice within 90 days. Ties at the boundary receive fractional inclusion. This is not precision for all addresses.")
         st.caption(f"Test outcomes: {meta['holdout_cutoff'] + pd.Timedelta(days=1):%b %d, %Y}–{meta['forecast_as_of']:%b %d, %Y}. Observed recurrence: {served['event_rate']:.1%}. This is one retrospective period, not a guarantee of future performance.")
         comparison = result.get("model_comparison", pd.DataFrame([
             {"Model":"Enhanced recurrence", **meta["candidate_metrics"]},
             {"Model":"Recent-history baseline", **baseline},
-        ])).rename(columns={"brier_score":"Brier error ↓", "average_precision":"Average precision ↑", "event_rate":"Observed recurrence", "log_loss":"Log loss ↓"})
-        st.dataframe(comparison.style.format({"Brier error ↓":"{:.4f}","Average precision ↑":"{:.4f}","Observed recurrence":"{:.1%}", "Log loss ↓":"{:.4f}"}), hide_index=True, width="stretch")
+        ])).rename(columns={"brier_score":"Brier error ↓", "average_precision":"Average precision ↑", "event_rate":"Observed recurrence", "log_loss":"Log loss ↓", "precision_top_10":"Top-10% precision ↑"})
+        st.dataframe(comparison.style.format({"Brier error ↓":"{:.4f}","Average precision ↑":"{:.4f}","Observed recurrence":"{:.1%}", "Log loss ↓":"{:.4f}", "Top-10% precision ↑":"{:.1%}"}), hide_index=True, width="stretch")
         st.download_button("Download independent test comparison", comparison.to_csv(index=False), "notice_model_comparison.csv", "text/csv")
         if "validation_trials" in result:
             with st.expander("Earlier model-selection scores and parameters"):
                 st.dataframe(result["validation_trials"], hide_index=True, width="stretch")
-                st.caption("XGBoost replaces the eligible ridge model only if selection Brier is strictly lower and average precision is no lower. This decision is frozen before the final test.")
+                st.caption("Scores are equal-weight means across up to three earlier 90-day periods. XGBoost must lower Brier without reducing average precision or top-decile precision versus eligible ridge. Selection is frozen before the latest evaluation.")
+                if "rolling_validation" in result:
+                    st.download_button("Download scores for each validation period", result["rolling_validation"].to_csv(index=False), "rolling_validation.csv", "text/csv")
         calibration = result["calibration"]
         st.subheader("Do the probabilities match observed outcomes?")
         fig = go.Figure(go.Scatter(x=calibration.predicted_probability, y=calibration.observed_rate,
@@ -114,9 +118,9 @@ def render_forecast(result, eligible_addresses, records, inspector):
 Eligible addresses had at least one notice in the preceding 365 days. The target is any new notice in the next 90 days. Unseen addresses cannot be scored. Address text is not a verified parcel or ownership identifier; units may be combined or split by source formatting.
 
 ### Training and safeguards
-Snapshots are 90 days apart with non-overlapping outcome windows. With at least five mature snapshots, earlier snapshots train, the third-last calibrates XGBoost, the penultimate selects the candidate, and the final independently tests the frozen choice. The test procedure refits on earlier data and calibrates on the selection period, whose outcomes are fully observed before the test origin. No final-test labels tune or select models. Shorter histories use the legacy ridge-only fallback, explicitly marked in the performance tab.
+Snapshots are 90 days apart with non-overlapping outcome windows. With at least five mature snapshots, up to three earlier validation origins each use older training snapshots and a separate immediately preceding calibration snapshot. Equal-weight mean scores select the candidate. The final origin evaluates the frozen choice. No latest-period labels tune or select models in this procedure. That period was examined during previous development, so a fresh prospective evaluation is still required. Shorter histories use the legacy ridge-only fallback.
 
-XGBoost and the enhanced ridge model use the same 15 historical features. The two-feature recent-history baseline uses notice frequency and recency. XGBoost tests three shallow-tree configurations (depth 2 or 3, L2 penalty 10 or 30), using 160 rounds, learning rate 0.05 and two CPU threads. Sigmoid calibration is fitted on a separate earlier period. XGBoost must improve selection Brier without reducing average precision versus the eligible ridge model. Only historical information is used; no demographic characteristics or actual rent-paid data are features.
+XGBoost and enhanced ridge use the same 15 historical features. Six booster configurations test depth 2–4, L2 penalty 10/30, 160 or 320 rounds, learning rate .05/.03, minimum child weight 10/30, and optional 365-day half-life training weights. Each tests monotone sigmoid calibration minimizing either log loss or Brier error plus .001 times slope squared. XGBoost must lower mean validation Brier without reducing mean average precision or highest-risk-decile precision versus eligible ridge. Two CPU threads keep resource use bounded. No demographic characteristics or actual rent-paid data are features.
 
 For live XGBoost forecasts, the latest mature snapshot is reserved for calibration and earlier mature snapshots train the base model. Ridge models refit on all mature snapshots. New validated source files or a changed end date trigger rebuilding. Test scores describe the historical procedure, not a direct test of the latest refit. XGBoost explanations use native TreeSHAP contributions to calibrated log-odds; gain importance is not a causal effect.
 
