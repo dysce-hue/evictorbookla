@@ -8,7 +8,7 @@ from methods_ui import METHODS, methods_markdown
 class MethodsTests(unittest.TestCase):
     def test_inventory_and_export(self):
         expected = {"counting", "time_composition", "rent", "concentration", "routine", "spatial", "correlation",
-                    "rent_comparison", "anomalies", "ols", "attention", "features", "logistic", "validation", "intervals", "map_sources"}
+                    "rent_comparison", "anomalies", "ols", "attention", "features", "logistic", "validation", "xgboost", "intervals", "map_sources"}
         self.assertEqual({m["id"] for m in METHODS}, expected)
         self.assertEqual(len(METHODS), len(expected))
         text = methods_markdown()

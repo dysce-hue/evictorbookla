@@ -458,6 +458,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 st.title("EVICTOR BOOK ALPHA")
+st.info("These data describe reported EVICTION NOTICES—not completed evictions, court judgments, unique tenants, or confirmed displacement. Counts and forecasts refer to notices unless explicitly stated otherwise.")
+try:
+    st.page_link("app_beta.py", label="BETA · 90-day notice predictor", icon="📊")
+except st.errors.StreamlitAPIException:
+    st.page_link("pages/1_policy.py", label="BETA · 90-day notice predictor", icon="📊")
 st.caption("Los Angeles reported eviction notices · 3D map, rent comparisons, address profiles and research tools")
 
 st.markdown(
@@ -710,7 +715,7 @@ else:
     start_date, end_date = min_date.date(), max_date.date()
 
 min_evict_count = st.sidebar.number_input(
-    "Minimum Evictions at Address",
+    "Minimum notices per address-date",
     min_value=1,
     max_value=200,
     value=1,
@@ -2329,10 +2334,10 @@ df_rent_records = rent_records.merge(
 # ==============================
 tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
     [
-        " Eviction Trend",
+        " Notice Trend",
         " Rent Comparison",
         " Rent Owed Distribution",
-        " Eviction Causes",
+        " Notice Causes",
         " Demographics (Census Data)",
     ], on_change="rerun", key="alpha_analytics_tabs",
 )
@@ -2340,7 +2345,7 @@ tab_trend, tab_cpi, tab_hist, tab_causes, tab_demo = st.tabs(
 # --- Eviction Trend (monthly) ---
 with tab_trend:
     if tab_trend.open:
-        st.subheader("Monthly Evictions")
+        st.subheader("Monthly eviction notices")
         st.caption("Counts are LAHD notice records received, not completed evictions or unique tenants. This chart follows map filters and includes only geocoded records. See Methods for all-source monthly coverage.")
         st.caption("Use mouse to click on a data point to view evictions of that month on the map. Click 'clear chart based filters' on the left to reset data.")
         df_trend = ev_filtered.copy()

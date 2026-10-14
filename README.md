@@ -19,7 +19,9 @@ A pair of local, interactive Los Angeles eviction-notice applications that share
 
 Optional enrichment templates live in `data_templates/`. These inputs are never silently treated as source data: owner names, policy events, and renter-household denominators must be supplied and reviewed by the user.
 
-The Beta forecast is intentionally limited to addresses already observed during the preceding 365 days. It uses chronological holdout testing, compares its ridge-logistic candidate with a recent-history baseline, and rebuilds when the validated source CSV changes. It remains a shadow-mode research and outreach aid; it does not predict completed evictions or establish wrongdoing.
+The Beta forecast is intentionally limited to addresses already observed during the preceding 365 days. It compares calibrated XGBoost, enhanced ridge logistic regression and a recent-history baseline, using separate chronological training, calibration, selection and final-test periods. XGBoost replaces the eligible ridge model only with strictly lower selection Brier and no reduction in average precision. It rebuilds when the validated source CSV, selected origin or model version changes. It remains a shadow-mode research and supportive-outreach aid; it predicts reported eviction notices, not completed evictions or wrongdoing. Model-selection uncertainty and reporting/backfill errors are not covered by its approximate 95% intervals.
+
+XGBoost uses 160 shallow-tree rounds and two CPU threads. Live probability intervals use 30 whole-address bootstrap refits, with calibration refitted inside each sample. Ridge retains its address-clustered covariance intervals. On macOS, the XGBoost wheel requires OpenMP (`brew install libomp`); a project-local runtime at `.venv/lib/libomp.dylib` is also supported. Do not commit virtual environments or native libraries. Streamlit Cloud should install the declared XGBoost dependency; use `site.py` to expose BETA and its predictor on the combined site.
 
 ## Local setup
 
@@ -47,7 +49,9 @@ The Beta forecast is intentionally limited to addresses already observed during 
 
 Open http://127.0.0.1:8501/ and use the top navigation to switch between ALPHA's 3D map and BETA's policy tools. BETA is also available at /policy on the same server. Its address inspector opens the ALPHA map on this same site with the selected address and period.
 
-The original entry point remains supported: `streamlit run app.py` runs ALPHA alone, with the complete mathematical reference inside its Methods tab. Use `site.py` for the combined ALPHA/BETA navigation and the dedicated `/methods` page.
+The original entry point remains supported: `streamlit run app.py` starts ALPHA with the complete mathematical reference inside its Methods tab. Use `site.py` for the combined top navigation and the dedicated `/methods` page.
+
+The original `app.py` deployment also discovers `pages/1_policy.py`, exposing BETA and its 90-day predictor as the sidebar's **policy** page (`/policy`). `site.py` retains the combined top navigation. A reproducible one-period XGBoost evaluation is recorded in `data/model_evaluation_xgboost_2026-10-14.json`; it is a dated audit snapshot, not a live result.
 
 The map requires `MAPBOX_TOKEN`. FRED uses the national rent-of-primary-residence index `CUSR0000SEHA`. If a valid 32-character `FRED_API_KEY` is unavailable or rejected, the app tries FRED's public CSV. Error messages never include the credential or authenticated URL.
 

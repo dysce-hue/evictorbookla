@@ -1,0 +1,21 @@
+{
+  "evaluated_on": "2026-10-14",
+  "model_version": "temporal-xgboost-v4-calibrated-ci95",
+  "source": "data/cleaned_evictions_final.csv",
+  "source_records_through": "2026-09-28",
+  "selection_origin": "2026-04-01",
+  "test_origin": "2026-06-30",
+  "test_outcomes": ["2026-07-01", "2026-09-28"],
+  "test_addresses": 16069,
+  "live_addresses": 16035,
+  "live_intervals_available": 16035,
+  "bootstrap_refits": 30,
+  "selected_before_final_test": {"family": "xgboost", "depth": 3, "penalty": 30.0},
+  "test_metrics": {
+    "Recent-history baseline": {"brier_score": 0.13785621259079478, "average_precision": 0.5679134242959387, "log_loss": 0.44093793313067475},
+    "Enhanced ridge logistic": {"brier_score": 0.12400125355170732, "average_precision": 0.6409622179131499, "log_loss": 0.40141360535956105},
+    "Calibrated XGBoost": {"brier_score": 0.12290627852882646, "average_precision": 0.6448580200342436, "log_loss": 0.397262489187825}
+  },
+  "reproduction": "Load CSV with pandas; call policy_metrics.prepare_notices, then policy_metrics.predictive_building_forecast with as_of_date='2026-09-28'. XGBoost 3.4.1; fixed seed 2026; 160 boosting rounds.",
+  "limits": "One retrospective test period. Not prospective accuracy or a significance test. Historical source publication timestamps are unavailable. Approximate probability intervals exclude model selection, source/reporting error and future policy changes. Target is another reported notice, not a completed eviction."
+}

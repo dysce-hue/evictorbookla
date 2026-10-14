@@ -127,17 +127,27 @@ METHODS = [
            r"\beta_{new}=\beta+(X^TWX+\lambda D)^{-1}\{X^T(y-p)-\lambda D\beta\},\quad Contribution_j=z_j\beta_j"],
           "policy_metrics.py: _sigmoid, _fit_ridge_logistic, predictive_building_forecast"),
     topic("validation", "Chronological selection, Brier score, AP and calibration", "Forecast evaluation", "BETA",
-          "At least four nonempty snapshots are required; origins are 90 days apart with non-overlapping future target windows. Earlier snapshots train; penultimate validates; last tests frozen selection. "
-          "Select enhanced λ from {0.5,10,100} by lowest validation Brier. Serve enhanced only if validation Brier is strictly lower and AP no lower than baseline. Otherwise serve baseline. "
-          "Refit selected structure on all mature snapshots for live scoring; test metrics evaluate the historical procedure, not this latest refit directly. "
+          "The XGBoost comparison needs five nonempty mature snapshots; origins are 90 days apart with non-overlapping targets. Earlier snapshots train, third-last calibrates, penultimate selects, and last tests the frozen choice. Four-snapshot histories use the legacy ridge-only procedure. "
+          "Select ridge λ from {0.5,10,100}; it must improve selection Brier without reducing AP versus the two-feature baseline. XGBoost must then improve both criteria versus that eligible ridge choice (strictly lower Brier, AP no lower). "
+          "Test models train on older snapshots; XGBoost calibration uses the selection period, whose outcomes finish by the test origin. Live XGBoost reserves the latest mature snapshot for calibration; live ridge uses all mature snapshots. Test metrics evaluate the procedure, not the latest refit directly. "
           "Brier is average squared probability error (lower better), not percent accuracy. AP integrates precision over changes in recall at distinct descending score thresholds; tied scores share a threshold. "
           "Calibration uses up to 10 equal-frequency score bins (duplicate boundaries dropped), comparing mean prediction with observed event share. Live probabilities are not remapped using test outcomes. "
           "The model rebuilds on source modification, version or selected cutoff changes. Multiple independent future periods and fairness checks remain needed.",
           [r"Brier=\frac1n\sum_i(p_i-y_i)^2,\quad AP=\sum_k(Recall_k-Recall_{k-1})Precision_k",
            r"Precision=TP/(TP+FP),\quad Recall=TP/\sum_i y_i,\quad\bar p_b=\frac1{n_b}\sum_{i\in b}p_i,\quad\hat q_b=\frac1{n_b}\sum_{i\in b}y_i"],
-          "policy_metrics.py: predictive_building_forecast, _average_precision, _model_metrics, _calibration_table"),
+          "policy_metrics.py: _average_precision, _model_metrics, _calibration_table; xgboost_forecast.py: predictive_forecast, _metrics"),
+    topic("xgboost", "Calibrated XGBoost and address-bootstrap uncertainty", "Forecast model", "BETA",
+          "XGBoost fits 160 gradient-boosted logistic trees on the same 15 historical features as ridge. Three configurations use depth 2/L2 10, depth 3/L2 10, or depth 3/L2 30. Learning rate=.05, min_child_weight=10, L1=.1, histogram max_bin=64, two CPU threads, seed=2026. No test-set early stopping or test-fitted calibration is used. "
+          "Sigmoid calibration uses a separate earlier mature period: nonnegative slope A and intercept B minimize weighted binary log loss plus .001A². Single-class calibration uses a smoothed constant event rate. "
+          "Thirty bootstrap refits jointly resample whole address clusters across base-training and calibration; repeated snapshots for one sampled address share its multiplicity. The booster and calibration are both refitted. The standard deviation of bootstrap calibrated logits supplies an approximate normal 95% margin around the point-estimate logit; at least 20 refits are needed. Feature definitions, selected family and hyperparameters are fixed. This is not a percentile interval or a calibrated coverage guarantee. Cross-address/time dependence, selection uncertainty, reporting error and policy changes are excluded. "
+          "TreeSHAP contributions sum to the booster margin; multiplying feature contributions by calibration slope explains the calibrated logit. Global gain importance measures split improvement, not causation. Rebuilding uses source modification, forecast origin and model version; the app caches the result.",
+          [r"F(x)=F_0+\sum_{m=1}^{160}\eta f_m(x),\quad p_{raw}=\sigma(F(x)),\quad p_{cal}=\sigma(AF(x)+B),\quad A\geq0",
+           r"LogLoss=-\frac1n\sum_i[y_i\log p_i+(1-y_i)\log(1-p_i)]",
+           r"s_{boot,a}=SD(\eta_a^{*(1)},\ldots,\eta_a^{*(B)}),\quad CI_a=\sigma(\hat\eta_a\pm1.959964s_{boot,a})",
+           r"F(x)=\phi_0+\sum_j\phi_j,\quad\eta_{cal}=A\phi_0+B+\sum_jA\phi_j"],
+          "xgboost_forecast.py: _fit_booster, _fit_platt, _bootstrap_intervals, predictive_forecast; forecast_ui.py"),
     topic("intervals", "95% confidence intervals: group rates and address probabilities", "Approximate uncertainty", "BETA",
-          "Wilson bounds estimate observed recurrence in test calibration groups, with z=1.959964. Address probability bounds use a sandwich covariance clustered by address across repeated snapshots. "
+          "Wilson bounds estimate observed recurrence in test calibration groups, with z=1.959964. Ridge address-probability bounds use a sandwich covariance clustered by address across repeated snapshots; XGBoost's separate bootstrap procedure is documented in its model section. "
           "X includes the intercept; D leaves it unpenalized; G=training addresses; n=rows; k=coefficients including intercept. H's inverse is computed using a pseudoinverse. "
           "Bounds are unavailable with G<2 or n≤k. All are pointwise. Address intervals treat transformations, selected features and λ as fixed; "
           "regularization bias, model selection, cross-address dependence, source error and policy changes can affect coverage. "
@@ -174,7 +184,7 @@ def methods_markdown():
 def render_mathematical_methods():
     st.header("Mathematical methods")
     st.caption("Shared reference for every analytical calculation used in ALPHA and BETA. Descriptive scores, forecasts, source estimates and visual encodings are identified separately.")
-    st.info("Only two fitted forecast model families are currently implemented: monthly OLS and address-level ridge logistic regression. No causal policy-effect model, survival model, random forest, neural network, Moran's I or owner-level eviction model is currently implemented.")
+    st.info("Three forecast model families are implemented: monthly OLS, address-level ridge logistic regression, and calibrated XGBoost. XGBoost is a challenger selected only by earlier evaluation—not assumed superior. No causal policy-effect, survival, neural-network, Moran's I or owner-level eviction model is implemented.")
     st.download_button("Download all methods and formulas", methods_markdown(), "evictor_book_mathematical_methods.md", "text/markdown", key="methods_download")
     selected = st.selectbox("Find a method", ["All methods"] + [m["title"] for m in METHODS], key="method_topic")
     if selected == "All methods":

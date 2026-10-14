@@ -8,7 +8,7 @@ import pandas as pd
 
 FORECAST_HORIZON_DAYS = 90
 FORECAST_LOOKBACK_DAYS = 365
-FORECAST_MODEL_VERSION = "temporal-ridge-v3-ci95"
+FORECAST_MODEL_VERSION = "temporal-xgboost-v4-calibrated-ci95"
 
 FORECAST_FEATURES = [
     "log_notices_30",
@@ -557,7 +557,7 @@ def _calibrate_live_probabilities(
     return np.interp(probabilities, centers, observed, left=observed[0], right=observed[-1])
 
 
-def predictive_building_forecast(
+def _ridge_predictive_building_forecast(
     df: pd.DataFrame,
     as_of_date: object | None = None,
 ) -> dict[str, object]:
@@ -725,3 +725,9 @@ def predictive_building_forecast(
         "coefficients": coefficients,
         "metadata": metadata,
     }
+
+
+def predictive_building_forecast(df, as_of_date=None):
+    """Compare XGBoost with ridge models without using final test labels to select."""
+    from xgboost_forecast import predictive_forecast
+    return predictive_forecast(df, as_of_date)

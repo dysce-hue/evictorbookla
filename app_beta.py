@@ -259,6 +259,7 @@ st.markdown(
 )
 
 st.title("EVICTOR BOOK BETA")
+st.info("These are reported EVICTION NOTICES—not completed evictions, court judgments, unique tenants, or confirmed displacement. The predictor estimates another reported notice within 90 days, not whether a tenant will be evicted.")
 st.caption("Policy analysis and experimental forecasts. Use the navigation above to return to the ALPHA 3D map.")
 
 st.sidebar.header("EVICTOR BOOK BETA")

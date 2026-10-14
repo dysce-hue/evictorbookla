@@ -52,9 +52,9 @@ def render_forecast(result, eligible_addresses, records, inspector):
                                   xaxis=dict(range=[0,1.08], tickformat=".0%", title="Probability of a new notice"),
                                   yaxis=dict(title=None, automargin=True))
                 st.plotly_chart(fig, width="stretch")
-                st.caption("Whiskers are approximate 95% confidence intervals for the estimated probability, allowing repeated observations at the same address to be correlated. They are conditional on the selected model and exclude model-selection uncertainty, reporting errors, and policy changes; future 0/1 outcomes do not fall inside a probability interval.")
+                st.caption(f"Whiskers: {meta['interval_method']}. They are conditional on the selected model and exclude model-selection uncertainty, reporting errors, cross-address/time dependence, and policy changes. Future 0/1 outcomes do not fall inside a probability interval; nominal 95% coverage is unverified.")
                 if view[["ci_lower_95", "ci_upper_95"]].isna().any().any():
-                    st.warning("Some confidence intervals are unavailable: estimation needs at least two independent address clusters and more training rows than fitted coefficients. Missing bounds are not zero uncertainty.")
+                    st.warning("Some confidence intervals are unavailable. Ridge estimation needs enough independent address clusters and training rows; XGBoost needs at least 20 successful cluster-bootstrap refits. Missing bounds are not zero uncertainty.")
                 table = view[["full_address", "forecast_probability", "ci_lower_95", "ci_upper_95", "forecast_tier", "notices_90", "active_months", "days_since_last", "momentum_label"]].rename(columns={
                     "full_address":"Address", "forecast_probability":"90-day probability (%)", "forecast_tier":"Tier",
                     "ci_lower_95":"95% CI lower (%)", "ci_upper_95":"95% CI upper (%)",
@@ -76,6 +76,8 @@ def render_forecast(result, eligible_addresses, records, inspector):
         served = meta["served_metrics"]
         baseline = meta["baseline_metrics"]
         st.subheader(meta["selected_model"])
+        if meta.get("xgboost_status"):
+            st.caption(meta["xgboost_status"])
         if meta["promotion_gate_passed"]:
             st.success("Enhanced model selected on an earlier validation period. The later test below was not used to choose it.")
         else:
@@ -85,11 +87,16 @@ def render_forecast(result, eligible_addresses, records, inspector):
         cards[1].metric("Test ranking score", f"{served['average_precision']:.3f}", help="Average precision summarizes the precision–recall curve. Higher is better; not a percentage correctly predicted.")
         cards[2].metric("Test addresses", f"{meta['holdout_addresses']:,}")
         st.caption(f"Test outcomes: {meta['holdout_cutoff'] + pd.Timedelta(days=1):%b %d, %Y}–{meta['forecast_as_of']:%b %d, %Y}. Observed recurrence: {served['event_rate']:.1%}. This is one retrospective period, not a guarantee of future performance.")
-        comparison = pd.DataFrame([
+        comparison = result.get("model_comparison", pd.DataFrame([
             {"Model":"Enhanced recurrence", **meta["candidate_metrics"]},
             {"Model":"Recent-history baseline", **baseline},
-        ]).rename(columns={"brier_score":"Brier error ↓", "average_precision":"Average precision ↑", "event_rate":"Observed recurrence"})
-        st.dataframe(comparison.style.format({"Brier error ↓":"{:.4f}","Average precision ↑":"{:.4f}","Observed recurrence":"{:.1%}"}), hide_index=True, width="stretch")
+        ])).rename(columns={"brier_score":"Brier error ↓", "average_precision":"Average precision ↑", "event_rate":"Observed recurrence", "log_loss":"Log loss ↓"})
+        st.dataframe(comparison.style.format({"Brier error ↓":"{:.4f}","Average precision ↑":"{:.4f}","Observed recurrence":"{:.1%}", "Log loss ↓":"{:.4f}"}), hide_index=True, width="stretch")
+        st.download_button("Download independent test comparison", comparison.to_csv(index=False), "notice_model_comparison.csv", "text/csv")
+        if "validation_trials" in result:
+            with st.expander("Earlier model-selection scores and parameters"):
+                st.dataframe(result["validation_trials"], hide_index=True, width="stretch")
+                st.caption("XGBoost replaces the eligible ridge model only if selection Brier is strictly lower and average precision is no lower. This decision is frozen before the final test.")
         calibration = result["calibration"]
         st.subheader("Do the probabilities match observed outcomes?")
         fig = go.Figure(go.Scatter(x=calibration.predicted_probability, y=calibration.observed_rate,
@@ -107,16 +114,22 @@ def render_forecast(result, eligible_addresses, records, inspector):
 Eligible addresses had at least one notice in the preceding 365 days. The target is any new notice in the next 90 days. Unseen addresses cannot be scored. Address text is not a verified parcel or ownership identifier; units may be combined or split by source formatting.
 
 ### Training and safeguards
-Snapshots are 90 days apart. Their future outcome windows do not overlap. Earlier snapshots train the model, the penultimate snapshot chooses regularization and compares the enhanced model with the two-feature baseline, and the final snapshot independently tests the frozen choice. Training outcomes never extend past the next prediction origin.
+Snapshots are 90 days apart with non-overlapping outcome windows. With at least five mature snapshots, earlier snapshots train, the third-last calibrates XGBoost, the penultimate selects the candidate, and the final independently tests the frozen choice. The test procedure refits on earlier data and calibrates on the selection period, whose outcomes are fully observed before the test origin. No final-test labels tune or select models. Shorter histories use the legacy ridge-only fallback, explicitly marked in the performance tab.
 
-The enhanced logistic model adds active-month consistency, spread across filing days, recent share of annual activity, nonlinear recency, and a recency–frequency interaction to counts, distinct dates, momentum, and rent/cause fields. Only historical information is used; no demographic characteristics are features.
+XGBoost and the enhanced ridge model use the same 15 historical features. The two-feature recent-history baseline uses notice frequency and recency. XGBoost tests three shallow-tree configurations (depth 2 or 3, L2 penalty 10 or 30), using 160 rounds, learning rate 0.05 and two CPU threads. Sigmoid calibration is fitted on a separate earlier period. XGBoost must improve selection Brier without reducing average precision versus the eligible ridge model. Only historical information is used; no demographic characteristics or actual rent-paid data are features.
 
-After testing, the selected model is refitted on all fully observed snapshots for the live forecast. New validated source files or a changed end date trigger rebuilding. Test scores describe the historical training procedure, not a direct test of this latest refit.
+For live XGBoost forecasts, the latest mature snapshot is reserved for calibration and earlier mature snapshots train the base model. Ridge models refit on all mature snapshots. New validated source files or a changed end date trigger rebuilding. Test scores describe the historical procedure, not a direct test of the latest refit. XGBoost explanations use native TreeSHAP contributions to calibrated log-odds; gain importance is not a causal effect.
 
 ### Confidence intervals
-Each address receives an approximate 95% Wald confidence interval on the log-odds scale, transformed back to probability. A sandwich covariance estimator groups all training snapshots from the same address, with a cluster-count correction and Student-t critical value. The selected feature transformations, model, and ridge penalty are treated as fixed. These intervals quantify uncertainty in the fitted probability; they do not guarantee future outcomes or measure all sources of forecast error. Cross-address dependence and shrinkage bias may affect coverage. No independent 95% coverage claim has been established.
+Ridge models use approximate address-clustered sandwich-Wald intervals. XGBoost uses 30 whole-address bootstrap refits: each sampled address carries all its training and calibration snapshots, both the booster and calibration are refitted, and the bootstrap logit standard deviation supplies a normal 95% margin around the fitted logit. At least 20 refits are required. Model choice, features and hyperparameters remain fixed. These are approximate probability-confidence intervals—not intervals for completed evictions or individual 0/1 outcomes. They exclude selection uncertainty, reporting errors, cross-address/time dependence and future policy changes. Thirty refits are a computational compromise, not evidence of established 95% coverage.
 
 ### Limits
 These are observational notice records, not verified eviction outcomes. Historical snapshots are reconstructed from the current extract, without original publication timestamps; later backfills may bias retrospective tests. Source omissions, delayed reports, policy changes, address mismatches, and lack of building-unit denominators can bias forecasts. Missing records are not proof that no notice occurred. Use this for research and supportive outreach—not tenant screening or punitive decisions. Additional independent periods and fairness checks are needed before operational deployment.""")
-        st.caption(f"Version: {meta['model_version']} · {meta['training_snapshots']} snapshots · {meta['training_rows']:,} address-snapshots · Selected ridge penalty: {meta['selected_penalty']:g}")
-        st.dataframe(result["coefficients"].rename(columns={"feature_label":"Historical indicator","standardized_coefficient":"Log-odds coefficient"})[["Historical indicator","Log-odds coefficient"]], hide_index=True, width="stretch")
+        st.caption(f"Version: {meta['model_version']} · {meta['training_snapshots']} snapshots · {meta['training_rows']:,} address-snapshots · {meta['selected_model']}")
+        if meta.get("selected_parameters"):
+            st.json(meta["selected_parameters"])
+        if not result.get("feature_importance", pd.DataFrame()).empty:
+            st.dataframe(result["feature_importance"].rename(columns={"feature_label":"Historical indicator", "gain":"XGBoost gain importance"}), hide_index=True, width="stretch")
+            st.caption("Gain summarizes training split improvements, not causal effects or percentage contributions to eviction risk.")
+        elif not result["coefficients"].empty:
+            st.dataframe(result["coefficients"].rename(columns={"feature_label":"Historical indicator","standardized_coefficient":"Log-odds coefficient"})[["Historical indicator","Log-odds coefficient"]], hide_index=True, width="stretch")

@@ -9,3 +9,4 @@ pyproj<3.7.2
 shapely
 rtree
 openpyxl
+xgboost>=2.1,<4
