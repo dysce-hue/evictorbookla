@@ -18,7 +18,8 @@ def render_forecast(result, eligible_addresses, records, inspector):
     )
     st.info("Experimental probability of at least one new LAHD notice at an address observed in the past year. Not a prediction of completed evictions or wrongdoing.")
     st.caption("The sidebar end date sets the forecast origin. Other sidebar filters select displayed addresses; training and validation use the full source history through that date.")
-    outlook, performance, methods = st.tabs(["Address outlook", "Model performance", "How it works"])
+    st.caption(f"Selected model uses {len(meta.get('feature_names',[])) or 15} notice-history features. Current county parcel and LAHD enforcement data appear as inspector context, not historical training inputs; their old publication dates are unverified.")
+    outlook, performance, outreach, methods = st.tabs(["Address outlook", "Model performance", "Outreach capacity", "How it works"])
     with outlook:
         if view.empty:
             st.info("No eligible addresses match the sidebar filters.")
@@ -113,6 +114,9 @@ def render_forecast(result, eligible_addresses, records, inspector):
         fig.update_layout(height=420,xaxis=dict(title="Mean predicted probability",tickformat=".0%",range=[0,1]),yaxis=dict(title="Observed recurrence",tickformat=".0%",range=[0,1]),legend=dict(orientation="h"))
         st.plotly_chart(fig,width="stretch")
         st.caption("Bars show 95% Wilson confidence intervals for observed rates in test groups. These are separate from the address probability intervals. Geographic dependence and reporting delays can make them optimistic. Test outcomes are not used to remap live probabilities.")
+    with outreach:
+        from outreach_ui import render_outreach
+        render_outreach(result)
     with methods:
         st.markdown("""### Target and coverage
 Eligible addresses had at least one notice in the preceding 365 days. The target is any new notice in the next 90 days. Unseen addresses cannot be scored. Address text is not a verified parcel or ownership identifier; units may be combined or split by source formatting.
@@ -120,7 +124,7 @@ Eligible addresses had at least one notice in the preceding 365 days. The target
 ### Training and safeguards
 Snapshots are 90 days apart with non-overlapping outcome windows. With at least five mature snapshots, up to three earlier validation origins each use older training snapshots and a separate immediately preceding calibration snapshot. Equal-weight mean scores select the candidate. The final origin evaluates the frozen choice. No latest-period labels tune or select models in this procedure. That period was examined during previous development, so a fresh prospective evaluation is still required. Shorter histories use the legacy ridge-only fallback.
 
-XGBoost and enhanced ridge use the same 15 historical features. Six booster configurations test depth 2–4, L2 penalty 10/30, 160 or 320 rounds, learning rate .05/.03, minimum child weight 10/30, and optional 365-day half-life training weights. Each tests monotone sigmoid calibration minimizing either log loss or Brier error plus .001 times slope squared. XGBoost must lower mean validation Brier without reducing mean average precision or highest-risk-decile precision versus eligible ridge. Two CPU threads keep resource use bounded. No demographic characteristics or actual rent-paid data are features.
+Enhanced ridge uses 15 historical features. XGBoost additionally tests an enriched 20-feature variant: prior-month counts, 30-day acceleration, recent-week notice share, active weeks and the latest distinct-date gap. A gap unavailable from history uses 365 days. The enriched variant must lower mean validation Brier without reducing mean AP or top-decile precision versus eligible original-feature XGBoost. Seven booster configurations test depth 2–4, penalties 10/30, 160/320 rounds and optional recency weights; each tests log-loss/Brier sigmoid calibration. No current parcel/enforcement data, demographic characteristics or actual rent-paid data are historical features.
 
 For live XGBoost forecasts, the latest mature snapshot is reserved for calibration and earlier mature snapshots train the base model. Ridge models refit on all mature snapshots. New validated source files or a changed end date trigger rebuilding. Test scores describe the historical procedure, not a direct test of the latest refit. XGBoost explanations use native TreeSHAP contributions to calibrated log-odds; gain importance is not a causal effect.
 

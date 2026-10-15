@@ -1,0 +1,36 @@
+{
+  "observed_at": "2026-10-15T20:00:49.145881+00:00",
+  "parcel_source": "https://cache.gis.lacounty.gov/cache/rest/services/LACounty_Cache/LACounty_Parcel/FeatureServer/0",
+  "notice_source_sha256": "343bcb450611425e0b4076d30c4aba71d5dbb954dc75f6fa021be84c47991190",
+  "parcel_query_fields": [
+    "AIN",
+    "UseCode",
+    "Roll_Year",
+    "Units1",
+    "YearBuilt1",
+    "Units2",
+    "YearBuilt2",
+    "Units3",
+    "YearBuilt3",
+    "Units4",
+    "YearBuilt4",
+    "Units5",
+    "YearBuilt5"
+  ],
+  "parcel_batch_size": 150,
+  "requested_apns": 32686,
+  "matched_parcels": 30536,
+  "enforcement_source": "https://data.lacity.org/resource/eagk-wq48.csv",
+  "enforcement_rows": 60599,
+  "files": {
+    "lahd_cases_current.csv": "93a586af07ff888abf0b3c83e998e852b88e448385f3129224c2562aa9078576",
+    "county_parcels_current.csv": "c29ff01c3288ac405784c587a656d997d6401f3f42257fb36e28fe9abbc69079"
+  },
+  "limitations": [
+    "Availability is acquisition time, not historical publication time.",
+    "Parcel is not a verified building or owner identifier.",
+    "Units fields describe up to five building lines, not verified rental or occupied units.",
+    "Enforcement cases are not necessarily confirmed violations; current closure state cannot be backdated.",
+    "Excluded from retrospective model training until dated provenance is established."
+  ]
+}

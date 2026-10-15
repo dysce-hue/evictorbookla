@@ -1,0 +1,9 @@
+{
+  "source": "https://files.zillowstatic.com/research/public_csvs/zori/Zip_zori_uc_sfrcondomfr_sm_month.csv",
+  "observed_at": "2026-10-15T20:06:22.750204+00:00",
+  "original_payload_sha256": "a60963f429dbacf97e4371a8e4f9146322a09073d76031fc1fe477ca65183933",
+  "file": "zori_2026-10-15_a60963f429db.csv.gz",
+  "zip_rows": 256,
+  "latest_month": "2026-08-31",
+  "limitation": "Current revised vintage; not historical release-time data. Excluded from retrospective model fitting."
+}

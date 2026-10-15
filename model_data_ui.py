@@ -11,7 +11,7 @@ CROSSWALK_COLUMNS = ["full_address", "building_id", "apn", "unit_id", "match_sta
 GUIDE = """# Model data and prospective validation
 
 ## What is active
-The predictor still uses its existing 15 notice-history features reconstructed from the latest extract. No reporting-delay buffer has yet been estimated or applied. Optional building attributes are review-only until verified historical coverage and leakage-safe evaluation justify promotion. No claim of improved accuracy or 95% precision follows from this page.
+The predictor compares its original 15 notice-history features with five additional activity features. Optional building attributes are context/review-only until verified historical coverage and leakage-safe evaluation justify promotion. No reporting-delay buffer has yet been estimated or applied. No claim of 95% precision follows from this page.
 
 ## Reporting delays
 Non-dry-run LAHD refreshes now archive exact downloaded bytes in compressed, checksum-addressed files and log each observation in SQLite. Identical downloads share one payload. Even a stale download retained only for inspection is archived; the production source still passes the existing replacement checks. Dry runs do not write archives. The initial local baseline is an observation made today, not proof of historical availability.
@@ -50,9 +50,11 @@ Report Brier error, constant-prevalence and existing-model baselines, AP, precis
 
 def render_model_data():
     st.subheader("Model data & validation")
-    st.info("Acquisition and review tools—not new predictor features yet. Verified historical building data and a fresh future evaluation are still required.")
+    st.info("Official property context is now downloaded. It is not used in retrospective training: verified historical availability and building/rental-unit links are still required. Notice-history enrichment is tested separately in the predictor.")
     st.caption("Current forecasts still use the latest extract; reporting-delay-adjusted training is not yet active. More capture history is needed to estimate a maturity buffer.")
     st.caption("This view uses the full source/archive inventory; sidebar address, cause and district filters do not alter it.")
+    from property_context_ui import render_context_summary
+    render_context_summary()
     st.download_button("Download acquisition and validation guide", GUIDE, "model_data_guide.md", "text/markdown")
     inventory = capture_inventory(ARCHIVE)
     st.markdown("### Reporting-delay archives")
@@ -69,6 +71,8 @@ def render_model_data():
         except (ValueError, OSError) as error:
             st.error(f"Archive comparison unavailable: {error}. Preserve the archive and check its integrity; do not treat this as zero delay.")
             report = None
+        if report is not None and report.attrs.get("excluded_stale_snapshots"):
+            st.warning(f"Excluded {report.attrs['excluded_stale_snapshots']} older-ending source snapshot(s) from delay estimates. They remain archived; an older-ending extract cannot establish current reporting completeness.")
         if report is None:
             pass
         elif report.empty:

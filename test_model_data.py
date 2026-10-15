@@ -53,6 +53,14 @@ class ModelDataTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checksum"):
                 reporting_delay_report(temp)
 
+    def test_stale_source_not_used_as_reporting_delay_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive_download(pd.DataFrame([self.source("2026-01-12")]).to_csv(index=False).encode(),temp,"test","2026-01-15T12:00:00Z")
+            archive_download(pd.DataFrame([self.source("2025-01-01","2 MAIN ST")]).to_csv(index=False).encode(),temp,"test","2026-01-16T12:00:00Z")
+            report = reporting_delay_report(temp)
+            self.assertTrue(report.empty)
+            self.assertEqual(report.attrs["excluded_stale_snapshots"],1)
+
     def test_attributes_obey_both_dates_and_preserve_unmatched(self):
         ids = pd.DataFrame({"building_id":["A", "B", "C", "A"]})
         attributes = pd.DataFrame({"building_id":["A", "A", "B"],

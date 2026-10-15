@@ -97,6 +97,8 @@ def render_address_inspector(
         ),
     )
     profile = profiles.loc[selected]
+    from property_context_ui import render_address_context
+    render_address_context(records, selected)
     history = records[records["full_address"].eq(selected)].copy()
 
     metrics = st.columns(4)
@@ -194,7 +196,9 @@ def render_predictive_inspector(records: pd.DataFrame, forecast: pd.DataFrame) -
     )
 
     contribution_rows = []
-    for feature in FORECAST_FEATURES:
+    for feature in FORECAST_FEATURE_LABELS:
+        if f"contribution_{feature}" not in profile:
+            continue
         contribution_rows.append(
             {
                 "Driver": FORECAST_FEATURE_LABELS[feature],

@@ -53,11 +53,18 @@ def reporting_delay_report(directory):
     from data_refresh import EXPECTED_SOURCE, parse_source_content
     inventory = capture_inventory(directory).drop_duplicates("sha256")
     seen, rows = set(), []
+    latest_received, stale_count = None, 0
     for position, capture in enumerate(inventory.itertuples(index=False)):
         content = gzip.decompress((Path(directory) / f"{capture.sha256}.payload.gz").read_bytes())
         if hashlib.sha256(content).hexdigest() != capture.sha256:
             raise ValueError("Archive payload checksum mismatch")
         frame, _ = parse_source_content(content)
+        received_max = pd.to_datetime(frame["Date Received"],format="mixed",errors="coerce").max()
+        if latest_received is not None and pd.notna(received_max) and received_max < latest_received:
+            stale_count += 1
+            continue
+        if pd.notna(received_max):
+            latest_received = received_max
         canonical = frame.reindex(columns=sorted(EXPECTED_SOURCE)).fillna("").astype(str)
         for field in ["Date Received", "Notice Date"]:
             canonical[field] = pd.to_datetime(canonical[field], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
@@ -74,7 +81,9 @@ def reporting_delay_report(directory):
                     rows.append(dict(record_fingerprint=key, first_seen=capture.captured_at,
                                      received_date=date.date().isoformat(), observed_delay_days=int(days)))
         seen.update(hashes)
-    return pd.DataFrame(rows, columns=["record_fingerprint", "first_seen", "received_date", "observed_delay_days"]).drop_duplicates("record_fingerprint")
+    report = pd.DataFrame(rows, columns=["record_fingerprint", "first_seen", "received_date", "observed_delay_days"]).drop_duplicates("record_fingerprint")
+    report.attrs["excluded_stale_snapshots"] = stale_count
+    return report
 
 
 def point_in_time_attributes(addresses, attributes, origin):

@@ -1,0 +1,122 @@
+{
+  "notice_source_sha256": "343bcb450611425e0b4076d30c4aba71d5dbb954dc75f6fa021be84c47991190",
+  "evaluation_scope": "Retrospective development period, not a genuinely untouched future test; current external data excluded from model fitting",
+  "model_version": "temporal-xgboost-v6-activity-capacity-ci95",
+  "forecast_as_of": "2026-09-28 00:00:00",
+  "trained_through": "2026-09-28 00:00:00",
+  "forecast_horizon_days": 90,
+  "lookback_days": 365,
+  "training_rows": 174484,
+  "base_model_training_rows": 158415,
+  "training_snapshots": 10,
+  "holdout_addresses": 16069,
+  "promotion_gate_passed": true,
+  "selected_model": "Calibrated XGBoost",
+  "selected_family": "xgboost",
+  "selected_penalty": 30.0,
+  "selected_parameters": {
+    "family": "xgboost",
+    "calibration": "brier",
+    "depth": 4,
+    "penalty": 30.0,
+    "child": 30,
+    "enriched": true
+  },
+  "feature_names": [
+    "log_notices_30",
+    "log_notices_90",
+    "log_notices_365",
+    "log_filing_dates_90",
+    "log_filing_dates_365",
+    "recency",
+    "momentum",
+    "nonpayment_share_365",
+    "rent_reporting_share_365",
+    "log_rent_owed_365",
+    "active_month_share",
+    "filing_days_per_notice",
+    "recent_activity_share",
+    "recency_squared",
+    "recency_frequency",
+    "log_notices_previous_30",
+    "momentum_30",
+    "recent_week_share",
+    "active_week_share_90",
+    "log_recent_gap_days"
+  ],
+  "selected_capacity": "100 addresses",
+  "selection_cutoff": "2026-04-01 00:00:00",
+  "holdout_cutoff": "2026-06-30 00:00:00",
+  "calibration_cutoff": "2026-01-01 00:00:00",
+  "test_training_outcomes_through": "2026-06-30 00:00:00",
+  "forecast_end": "2026-12-27 00:00:00",
+  "candidate_metrics": {
+    "brier_score": 0.12401375249639701,
+    "average_precision": 0.6408867907916979,
+    "event_rate": 0.222415831725683,
+    "log_loss": 0.4014354056844884,
+    "precision_top_10": 0.7816292239716224
+  },
+  "baseline_metrics": {
+    "brier_score": 0.13785621259079478,
+    "average_precision": 0.5679134242959387,
+    "event_rate": 0.222415831725683,
+    "log_loss": 0.44093793313067475,
+    "precision_top_10": 0.7104387329640923
+  },
+  "xgboost_metrics": {
+    "brier_score": 0.12262367768011634,
+    "average_precision": 0.6463269695363212,
+    "event_rate": 0.222415831725683,
+    "log_loss": 0.3964812237881877,
+    "precision_top_10": 0.7971248988736076
+  },
+  "incumbent_metrics": {
+    "brier_score": 0.1227363440320552,
+    "average_precision": 0.6460152323216228,
+    "event_rate": 0.222415831725683,
+    "log_loss": 0.3967979335456074,
+    "precision_top_10": 0.7971248988736076
+  },
+  "served_metrics": {
+    "brier_score": 0.12262367768011634,
+    "average_precision": 0.6463269695363212,
+    "event_rate": 0.222415831725683,
+    "log_loss": 0.3964812237881877,
+    "precision_top_10": 0.7971248988736076
+  },
+  "validation_candidate_metrics": {
+    "brier_score": 0.12310220850161395,
+    "average_precision": 0.6517531590453641,
+    "event_rate": 0.2247905444233768,
+    "log_loss": 0.3995738303609014,
+    "precision_top_10": 0.7942601484149447
+  },
+  "validation_baseline_metrics": {
+    "brier_score": 0.1362699844461918,
+    "average_precision": 0.5845997843304188,
+    "event_rate": 0.2247905444233768,
+    "log_loss": 0.43715914758097085,
+    "precision_top_10": 0.7250790305630685
+  },
+  "validation_selected_metrics": {
+    "brier_score": 0.12159583934569729,
+    "average_precision": 0.6569149863753667,
+    "event_rate": 0.2247905444233768,
+    "log_loss": 0.3940597294665264,
+    "precision_top_10": 0.7985146710021572
+  },
+  "validation_xgboost_metrics": {
+    "brier_score": 0.12159583934569729,
+    "average_precision": 0.6569149863753667,
+    "event_rate": 0.2247905444233768,
+    "log_loss": 0.3940597294665264,
+    "precision_top_10": 0.7985146710021572
+  },
+  "confidence_level": 0.95,
+  "interval_method": "Approximate 95% address-cluster bootstrap logit-Wald interval (30 refits; model selection fixed)",
+  "interval_clusters": 43612,
+  "bootstrap_refits": 30,
+  "validation_periods": 3,
+  "xgboost_status": "Selected using rolling earlier periods; latest period is evaluation-only. This latest period was also inspected during prior development, so it is not a fresh prospective test."
+}

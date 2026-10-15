@@ -8,7 +8,8 @@ import pandas as pd
 
 FORECAST_HORIZON_DAYS = 90
 FORECAST_LOOKBACK_DAYS = 365
-FORECAST_MODEL_VERSION = "temporal-xgboost-v5-rolling-brier-ci95"
+FORECAST_MODEL_VERSION = "temporal-xgboost-v6-activity-capacity-ci95"
+EXTRA_FORECAST_FEATURES = ["log_notices_previous_30", "momentum_30", "recent_week_share", "active_week_share_90", "log_recent_gap_days"]
 
 FORECAST_FEATURES = [
     "log_notices_30",
@@ -29,6 +30,11 @@ FORECAST_FEATURES = [
 ]
 
 FORECAST_FEATURE_LABELS = {
+    "log_notices_previous_30": "Notices 30–59 days earlier",
+    "momentum_30": "30-day notice acceleration",
+    "recent_week_share": "Recent-week share of 90-day notices",
+    "active_week_share_90": "Active weeks in 90 days",
+    "log_recent_gap_days": "Gap between latest distinct notice dates (365 if unavailable)",
     "log_notices_30": "Notices in the last 30 days",
     "log_notices_90": "Notices in the last 90 days",
     "log_notices_365": "Notices in the last 365 days",
@@ -345,6 +351,9 @@ def _forecast_snapshot(
 
     age_days = (cutoff - history["Date_Filed"].dt.normalize()).dt.days
     history["in_30"] = age_days.le(29).astype(int)
+    history["in_previous_30"] = age_days.between(30,59).astype(int)
+    history["in_7"] = age_days.le(6).astype(int)
+    history["week_90"] = (age_days // 7).where(age_days.le(89))
     history["in_90"] = age_days.le(89).astype(int)
     history["in_prior_90"] = age_days.between(90, 179).astype(int)
     history["positive_rent"] = history["Rent_Owed_num"].where(history["Rent_Owed_num"].gt(0), 0).fillna(0)
@@ -357,6 +366,9 @@ def _forecast_snapshot(
         history.groupby("full_address", as_index=False)
         .agg(
             notices_30=("in_30", "sum"),
+            notices_previous_30=("in_previous_30", "sum"),
+            notices_7=("in_7", "sum"),
+            active_weeks_90=("week_90", "nunique"),
             notices_90=("in_90", "sum"),
             notices_prior_90=("in_prior_90", "sum"),
             notices_365=("Date_Filed", "size"),
@@ -395,6 +407,15 @@ def _forecast_snapshot(
     snapshot["recent_activity_share"] = snapshot["notices_90"] / snapshot["notices_365"]
     snapshot["recency_squared"] = snapshot["recency"] ** 2
     snapshot["recency_frequency"] = snapshot["recency"] * snapshot["log_notices_90"]
+    distinct = history[["full_address", "Date_Filed"]].drop_duplicates().sort_values(["full_address", "Date_Filed"])
+    gaps = distinct.groupby("full_address").Date_Filed.diff().dt.days
+    last_gaps = distinct.assign(gap=gaps).groupby("full_address").tail(1).set_index("full_address").gap
+    snapshot["log_recent_gap_days"] = np.log1p(snapshot.full_address.map(last_gaps).fillna(365))
+    snapshot["log_notices_previous_30"] = np.log1p(snapshot.notices_previous_30)
+    change = snapshot.notices_30 - snapshot.notices_previous_30
+    snapshot["momentum_30"] = np.sign(change) * np.log1p(change.abs())
+    snapshot["recent_week_share"] = snapshot.notices_7 / snapshot.notices_90.clip(lower=1)
+    snapshot["active_week_share_90"] = snapshot.active_weeks_90 / 13
     snapshot["cutoff"] = cutoff
 
     if include_target:

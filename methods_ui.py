@@ -105,16 +105,19 @@ METHODS = [
           "Property size is not controlled. Nonpayment share is 100 times exclusively categorized nonpayment notices divided by all address notices.",
           [r"P(x_a)=100\frac{average\_rank(x_a)}{A},\quad Score_a=.30P(N_a)+.25P(D_a)+.25P(R_a)+.20P(O_a)"],
           "policy_metrics.py: building_risk_portfolio"),
-    topic("features", "All 15 recurrence-model features", "Feature engineering", "BETA",
+    topic("features", "15 base features and 5 activity-enrichment features", "Feature engineering", "BETA",
           "Eligibility requires a notice at a known address in the preceding 365 days. Count windows include cutoff day: last 30 ages 0–29, last 90 ages 0–89, prior 90 ages 90–179, annual ages 0–364. "
           "Let N_w=count in w days, D_w=distinct dates, M=distinct calendar months, d=days since latest notice, NP=exclusively nonpayment notices, RP=notices with positive reported arrears, "
           "O=sum of positive arrears. Active months divide by 13 because 365 days can touch 13 calendar months. Missing dollars contribute zero to positive-dollar sums but not to reporting share. "
-          "Columns are standardized with training mean and population SD (ddof=0); zero/missing SD is replaced by 1. "
+          "Ridge columns are standardized with training mean and population SD (ddof=0); zero/missing SD is replaced by 1. XGBoost uses unstandardized features. "
+          "An enriched XGBoost also tests prior-30-day counts (ages 30–59), 30-day acceleration, recent-week share, active weeks in 90 days, and the gap between the two latest distinct notice dates. An unavailable gap uses 365 days. An explicit unit marker in an address is not a verified unit ID. "
           "Protected demographics, ZORI, unit counts and verified ownership are not features. Event dates precede cutoff, but current extracts may contain later backfills; publication-time availability is unverified.",
           [r"f_{1:5}=\log(1+N_{30}),\log(1+N_{90}),\log(1+N_{365}),\log(1+D_{90}),\log(1+D_{365})",
            r"f_6=r=1-d/365,\quad f_7=sign(N_{90}-N_{prior90})\log(1+|N_{90}-N_{prior90}|)",
            r"f_8=NP/N_{365},\ f_9=RP/N_{365},\ f_{10}=\log(1+O),\ f_{11}=M/13",
-           r"f_{12}=D_{365}/N_{365},\ f_{13}=N_{90}/N_{365},\ f_{14}=r^2,\ f_{15}=r\log(1+N_{90}),\quad z_j=(f_j-\mu_j)/s_j"],
+           r"f_{12}=D_{365}/N_{365},\ f_{13}=N_{90}/N_{365},\ f_{14}=r^2,\ f_{15}=r\log(1+N_{90}),\quad z_j=(f_j-\mu_j)/s_j",
+           r"f_{16}=\log(1+N_{prior30}),\quad f_{17}=sign(N_{30}-N_{prior30})\log(1+|N_{30}-N_{prior30}|)",
+           r"f_{18}=N_7/\max(N_{90},1),\quad f_{19}=W_{90}/13,\quad f_{20}=\log(1+gap_{latest\ dates})"],
           "policy_metrics.py: FORECAST_FEATURES, _forecast_snapshot, predictive_building_forecast"),
     topic("logistic", "90-day ridge logistic regression and baseline", "Forecast model", "BETA",
           "Target: any new LAHD notice at an eligible address over cutoff+1 through cutoff+90. This is a binary recurrence target, not expected notice count or tenant displacement. "
@@ -132,12 +135,12 @@ METHODS = [
           "Test models train on older snapshots; XGBoost calibration uses the selection period, whose outcomes finish by the test origin. Live XGBoost reserves the latest mature snapshot for calibration; live ridge uses all mature snapshots. Test metrics evaluate the procedure, not the latest refit directly. "
           "Brier is average squared probability error (lower better), not percent accuracy. AP integrates precision over changes in recall at distinct descending score thresholds; tied scores share a threshold. "
           "Calibration uses up to 10 equal-frequency score bins (duplicate boundaries dropped), comparing mean prediction with observed event share. Live probabilities are not remapped using test outcomes. "
-          "The model rebuilds on source modification, version or selected cutoff changes. The latest evaluation was inspected during previous development: it is evaluation-only in this procedure, not a fresh prospective test. Independent future periods and fairness checks remain needed.",
+          "Fixed-capacity precision/recall compares 100/500/1000 addresses and top 1/5/10%; ties use a fixed outcome-independent address hash. Capacity is chosen by mean earlier precision then recall, before latest evaluation. Wilson intervals ignore spatial dependence and selection uncertainty. The model rebuilds on source modification, version or cutoff changes. Latest evaluation was inspected during previous development, not a fresh prospective test.",
           [r"Brier=\frac1n\sum_i(p_i-y_i)^2,\quad AP=\sum_k(Recall_k-Recall_{k-1})Precision_k",
-           r"Precision=TP/(TP+FP),\quad Recall=TP/\sum_i y_i,\quad\bar p_b=\frac1{n_b}\sum_{i\in b}p_i,\quad\hat q_b=\frac1{n_b}\sum_{i\in b}y_i"],
-          "policy_metrics.py: _average_precision, _model_metrics, _calibration_table; xgboost_forecast.py: predictive_forecast, _metrics"),
+           r"Precision@K=TP_K/K,\quad Recall@K=TP_K/\sum_i y_i,\quad\bar p_b=\frac1{n_b}\sum_{i\in b}p_i,\quad\hat q_b=\frac1{n_b}\sum_{i\in b}y_i"],
+          "policy_metrics.py: _average_precision, _model_metrics, _calibration_table; xgboost_forecast.py: predictive_forecast, _metrics; outreach_metrics.py: capacity_table, choose_capacity"),
     topic("xgboost", "Calibrated XGBoost and address-bootstrap uncertainty", "Forecast model", "BETA",
-          "Six XGBoost configurations use depth 2–4, L2 10/30, 160 rounds at .05 or 320 at .03, minimum child weight 10/30 and optional 365-day half-life training weights. L1=.1, histogram max_bin=64, two CPU threads, seed=2026. No latest-period early stopping or calibration is used. "
+          "Seven XGBoost configurations include a 20-feature activity variant and use depth 2–4, L2 10/30, 160 rounds at .05 or 320 at .03, minimum child weight 10/30 and optional 365-day half-life training weights. The activity variant must also improve mean Brier with no reduction in AP or top-decile precision versus eligible original-feature XGBoost. L1=.1, histogram max_bin=64, two CPU threads, seed=2026. No latest-period early stopping or calibration is used. "
           "Each configuration tests monotone sigmoid calibration on a separate earlier mature period: nonnegative slope A and intercept B minimize weighted binary log loss or squared probability error, plus .001A². Single-class calibration uses a smoothed constant event rate. "
           "Thirty bootstrap refits jointly resample whole address clusters across base-training and calibration; repeated snapshots for one sampled address share its multiplicity. The booster and calibration are both refitted. The standard deviation of bootstrap calibrated logits supplies an approximate normal 95% margin around the point-estimate logit; at least 20 refits are needed. Feature definitions, selected family and hyperparameters are fixed. This is not a percentile interval or a calibrated coverage guarantee. Cross-address/time dependence, selection uncertainty, reporting error and policy changes are excluded. "
           "TreeSHAP contributions sum to the booster margin; multiplying feature contributions by calibration slope explains the calibrated logit. Global gain importance measures split improvement, not causation. Rebuilding uses source modification, forecast origin and model version; the app caches the result.",

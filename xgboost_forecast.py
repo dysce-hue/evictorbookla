@@ -18,7 +18,8 @@ BASE_INDEXES = [pm.FORECAST_FEATURES.index(f) for f in ["log_notices_90", "recen
 XGB_CONFIGS = [dict(depth=2, penalty=10.), dict(depth=3, penalty=10.), dict(depth=3, penalty=30.),
                dict(depth=3, penalty=30., rounds=320, eta=.03),
                dict(depth=4, penalty=30., child=30),
-               dict(depth=3, penalty=30., half_life=365)]
+               dict(depth=3, penalty=30., half_life=365),
+               dict(depth=4, penalty=30., child=30, enriched=True)]
 
 
 @lru_cache(maxsize=1)
@@ -31,8 +32,8 @@ def _xgboost():
     return xgboost
 
 
-def _matrix(frame):
-    return frame[pm.FORECAST_FEATURES].to_numpy(dtype=np.float32)
+def _matrix(frame, features=None):
+    return frame[features or pm.FORECAST_FEATURES].to_numpy(dtype=np.float32)
 
 
 def _logit(probability):
@@ -75,8 +76,9 @@ def _fit_booster(training, config, weights=None):
     keep = w > 0
     if not keep.any():
         raise ValueError("Empty bootstrap training sample")
-    matrix = xgb.DMatrix(_matrix(training)[keep], label=y[keep], weight=w[keep],
-                         feature_names=pm.FORECAST_FEATURES, nthread=2)
+    features = pm.FORECAST_FEATURES + (pm.EXTRA_FORECAST_FEATURES if config.get("enriched") else [])
+    matrix = xgb.DMatrix(_matrix(training,features)[keep], label=y[keep], weight=w[keep],
+                         feature_names=features, nthread=2)
     rate = float(np.clip(np.average(y[keep], weights=w[keep]), 1e-4, 1-1e-4))
     params = dict(objective="binary:logistic", eval_metric="logloss", tree_method="hist",
                   max_bin=64, max_depth=config["depth"], eta=config.get("eta", .05), min_child_weight=config.get("child", 10),
@@ -87,7 +89,7 @@ def _fit_booster(training, config, weights=None):
 
 def _booster_predict(booster, frame, **kwargs):
     xgb = _xgboost()
-    return booster.predict(xgb.DMatrix(_matrix(frame), feature_names=pm.FORECAST_FEATURES, nthread=2), **kwargs)
+    return booster.predict(xgb.DMatrix(_matrix(frame,booster.feature_names), feature_names=booster.feature_names, nthread=2), **kwargs)
 
 
 def _fit_model(training, calibration, config, booster=None):
@@ -191,6 +193,7 @@ def predictive_forecast(df, as_of_date=None):
     trials = []
     fold_indexes = list(range(max(2, len(snapshots)-4), len(snapshots)-1))
     fold_rows = []
+    capacity_rows = []
     booster_cache = {}
     for config in configs:
         scores = []
@@ -200,7 +203,11 @@ def predictive_forecast(df, as_of_date=None):
             model = _fit_model(fold_training, snapshots[i-1], config, booster_cache.get(cache_key))
             if config["family"] == "xgboost":
                 booster_cache[cache_key] = model["booster"]
-            score = _metrics(snapshots[i].target_any_notice_90.to_numpy(), _predict(model, snapshots[i]))
+            probability = _predict(model, snapshots[i])
+            score = _metrics(snapshots[i].target_any_notice_90.to_numpy(), probability)
+            from outreach_metrics import capacity_table
+            capacity_rows.extend(capacity_table(snapshots[i].target_any_notice_90.to_numpy(), probability,
+                snapshots[i].full_address).assign(config=str(config), origin=str(snapshots[i].cutoff.iloc[0].date())).to_dict("records"))
             scores.append(score)
             fold_rows.append(dict(config=str(config), origin=str(snapshots[i].cutoff.iloc[0].date()), **score))
         metrics = {key: float(np.mean([s[key] for s in scores])) for key in scores[0]}
@@ -214,15 +221,28 @@ def predictive_forecast(df, as_of_date=None):
                     and t["metrics"]["brier_score"] < selected["metrics"]["brier_score"]
                     and t["metrics"]["average_precision"] >= selected["metrics"]["average_precision"]
                     and t["metrics"]["precision_top_10"] >= selected["metrics"]["precision_top_10"]]
+    old_eligible = [t for t in xgb_eligible if not t["config"].get("enriched")]
+    if old_eligible:
+        anchor = min(old_eligible,key=lambda t:t["metrics"]["brier_score"])["metrics"]
+        xgb_eligible = [t for t in xgb_eligible if not t["config"].get("enriched") or
+            (t["metrics"]["brier_score"] < anchor["brier_score"] and t["metrics"]["average_precision"] >= anchor["average_precision"] and t["metrics"]["precision_top_10"] >= anchor["precision_top_10"])]
     if xgb_eligible:
         selected = min(xgb_eligible, key=lambda t: t["metrics"]["brier_score"])
+    from outreach_metrics import choose_capacity
+    selected_capacity = choose_capacity(pd.DataFrame(capacity_rows), selected["config"])
     best_ridge = min([t for t in trials if t["config"]["family"] == "ridge"], key=lambda t: t["metrics"]["brier_score"])
     best_xgb = min([t for t in trials if t["config"]["family"] == "xgboost"], key=lambda t: t["metrics"]["brier_score"])
+    # Evaluate the exact promoted configuration, not an ineligible same-family trial.
+    if selected["config"]["family"] == "xgboost":
+        best_xgb = selected
+    elif selected["config"]["family"] == "ridge":
+        best_ridge = selected
     names = {"baseline": "Recent-history baseline", "ridge": "Enhanced ridge logistic", "xgboost": "Calibrated XGBoost"}
     # All outcomes used here finish by the final test's forecast origin.
     test_training = pd.concat(snapshots[:-2], ignore_index=True)
     test_rows = []
     test_models = {}
+    test_capacities = []
     for trial in [trials[0], best_ridge, best_xgb]:
         family = trial["config"]["family"]
         fitted = _fit_model(test_training, selection, trial["config"])
@@ -230,9 +250,11 @@ def predictive_forecast(df, as_of_date=None):
         metrics = _metrics(holdout.target_any_notice_90.to_numpy(), probability)
         test_rows.append(dict(Model=names[family], Selected=family == selected["config"]["family"], **metrics))
         test_models[family] = (metrics, probability)
-    incumbent = _fit_model(test_training, selection, dict(family="xgboost", depth=3, penalty=30.))
+        test_capacities.append(capacity_table(holdout.target_any_notice_90.to_numpy(), probability, holdout.full_address).assign(Model=names[family]))
+    incumbent = _fit_model(test_training, selection, dict(family="xgboost", depth=4, penalty=30., child=30, calibration="brier"))
     incumbent_metrics = _metrics(holdout.target_any_notice_90.to_numpy(), _predict(incumbent, holdout))
-    test_rows.append(dict(Model="Previous XGBoost (fixed reference)", Selected=False, **incumbent_metrics))
+    test_rows.append(dict(Model="Previous XGBoost (15 features)", Selected=False, **incumbent_metrics))
+    test_capacities.append(capacity_table(holdout.target_any_notice_90.to_numpy(), _predict(incumbent,holdout), holdout.full_address).assign(Model="Previous XGBoost (15 features)"))
     family = selected["config"]["family"]
     served_metrics, served_holdout = test_models[family]
     all_training = pd.concat(snapshots, ignore_index=True)
@@ -244,14 +266,16 @@ def predictive_forecast(df, as_of_date=None):
                                           if family == "xgboost" else live.forecast_probability)
     bootstrap_count = 0
     if family == "xgboost":
+        feature_names = live_model["booster"].feature_names
         low, high, clusters, bootstrap_count = _bootstrap_intervals(live_training, snapshots[-1], live, live_model)
         contribution = live_model["slope"] * _booster_predict(live_model["booster"], live, pred_contribs=True)[:, :-1]
         gains = live_model["booster"].get_score(importance_type="gain")
-        importance = pd.DataFrame({"feature_label": [pm.FORECAST_FEATURE_LABELS[f] for f in pm.FORECAST_FEATURES],
-                                   "gain": [gains.get(f, 0.) for f in pm.FORECAST_FEATURES]}).sort_values("gain", ascending=False)
+        importance = pd.DataFrame({"feature_label": [pm.FORECAST_FEATURE_LABELS[f] for f in feature_names],
+                                   "gain": [gains.get(f, 0.) for f in feature_names]}).sort_values("gain", ascending=False)
         coefficients = pd.DataFrame(columns=["feature", "feature_label", "standardized_coefficient"])
         interval_method = "Approximate 95% address-cluster bootstrap logit-Wald interval (30 refits; model selection fixed)"
     else:
+        feature_names = pm.FORECAST_FEATURES
         indexes = live_model["indexes"]
         standardized = (_matrix(live_training) - live_model["mean"]) / live_model["scale"]
         score = (_matrix(live) - live_model["mean"]) / live_model["scale"]
@@ -269,15 +293,15 @@ def predictive_forecast(df, as_of_date=None):
     live["ci_lower_95"], live["ci_upper_95"] = low, high
     live["forecast_tier"] = pd.cut(live.forecast_probability, [-np.inf, .15, .30, .50, np.inf],
                                   labels=["Lower", "Watch", "Elevated", "High"], right=False).astype(str)
-    live[[f"contribution_{f}" for f in pm.FORECAST_FEATURES]] = contribution
+    live[[f"contribution_{f}" for f in feature_names]] = contribution
     top = np.argsort(-contribution, axis=1)[:, :3]
-    live["top_drivers"] = [", ".join(pm.FORECAST_FEATURE_LABELS[pm.FORECAST_FEATURES[j]] for j in indexes if row[j] > 0)
+    live["top_drivers"] = [", ".join(pm.FORECAST_FEATURE_LABELS[feature_names[j]] for j in indexes if row[j] > 0)
                            or "Model baseline" for row, indexes in zip(contribution, top)]
     metadata = dict(model_version=pm.FORECAST_MODEL_VERSION, forecast_as_of=as_of,
         trained_through=as_of, forecast_horizon_days=90, lookback_days=365,
         training_rows=len(all_training), base_model_training_rows=len(live_training), training_snapshots=len(snapshots),
         holdout_addresses=len(holdout), promotion_gate_passed=family != "baseline", selected_model=names[family],
-        selected_family=family, selected_penalty=selected["config"]["penalty"], selected_parameters=selected["config"],
+        selected_family=family, selected_penalty=selected["config"]["penalty"], selected_parameters=selected["config"], feature_names=feature_names, selected_capacity=selected_capacity,
         selection_cutoff=cutoffs[-2], holdout_cutoff=cutoffs[-1], calibration_cutoff=cutoffs[-3],
         test_training_outcomes_through=cutoffs[-2]+pd.Timedelta(days=90), forecast_end=as_of+pd.Timedelta(days=90),
         candidate_metrics=test_models["ridge"][0], baseline_metrics=test_models["baseline"][0],
@@ -288,6 +312,7 @@ def predictive_forecast(df, as_of_date=None):
         bootstrap_refits=bootstrap_count, validation_periods=len(fold_indexes),
         xgboost_status="Selected using rolling earlier periods; latest period is evaluation-only. This latest period was also inspected during prior development, so it is not a fresh prospective test.")
     return dict(forecast=live.sort_values(["forecast_probability", "notices_90"], ascending=False).reset_index(drop=True),
+                outreach_validation=pd.DataFrame(capacity_rows), outreach_evaluation=pd.concat(test_capacities,ignore_index=True),
                 metadata=metadata, calibration=pm._calibration_table(holdout.target_any_notice_90.to_numpy(), served_holdout),
                 coefficients=coefficients, feature_importance=importance, model_comparison=pd.DataFrame(test_rows),
                 rolling_validation=pd.DataFrame(fold_rows),
