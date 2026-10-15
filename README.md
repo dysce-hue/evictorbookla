@@ -7,6 +7,8 @@ A pair of local, interactive Los Angeles eviction-notice applications that share
 
 ## Included features
 
+BETA's **Model data & validation** view provides source links, building crosswalk/dated-attribute CSV templates, point-in-time import review and a prospective evaluation guide. Non-dry-run LAHD refreshes archive exact downloaded payloads under `data/source_archives/`, gzip-compressed and deduplicated by SHA-256, with capture observations in SQLite. The local archive is ignored by Git and must be backed up to durable storage. Dry runs do not archive. A local baseline was observed on October 15, 2026; it does not establish historical publication dates. With multiple changed captures, the UI can measure first-observed minus received-date delays, excluding left-censored baseline identities. Record corrections and missing stable notice IDs limit this proxy. These tools do **not** yet add building attributes or a delay buffer to the production predictor.
+
 - Cluster, individual-point, heatmap, 3D-building, and neighborhood choropleth map modes
 - Monthly map animation, address search, editable multi-polygon selection, and CSV/GeoJSON export
 - Date, cause, council district, ZIP, APN, address, repeat-filing, rent, and neighborhood filters

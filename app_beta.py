@@ -322,6 +322,7 @@ view_options = [
     "Building risk portfolio",
     "Predictive risk (experimental)",
     "Data quality",
+    "Model data & validation",
     "Mathematical methods",
 ]
 selected_view = st.radio("Analysis view", view_options, horizontal=True, label_visibility="collapsed")
@@ -664,6 +665,10 @@ elif selected_view == "Data quality":
         - Rent owed is reported in the source and is not independently verified.
         """
     )
+
+elif selected_view == "Model data & validation":
+    from model_data_ui import render_model_data
+    render_model_data()
 
 elif selected_view == "Mathematical methods":
     render_mathematical_methods()

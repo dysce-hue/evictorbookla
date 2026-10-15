@@ -62,7 +62,7 @@ def parse_source_content(content: bytes) -> tuple[pd.DataFrame, str]:
     return frame, "csv"
 
 
-def download_source(session: requests.Session) -> tuple[pd.DataFrame, dict]:
+def download_source(session: requests.Session, archive_directory=None) -> tuple[pd.DataFrame, dict]:
     response = session.get(SOURCE_CSV, timeout=180)
     response.raise_for_status()
     if len(response.content) < 1000:
@@ -71,6 +71,9 @@ def download_source(session: requests.Session) -> tuple[pd.DataFrame, dict]:
     missing = sorted(EXPECTED_SOURCE - set(frame.columns))
     if missing:
         raise RefreshError(f"LAHD source schema changed; missing columns: {missing}")
+    if archive_directory is not None:
+        from model_data import archive_download
+        archive_download(response.content, archive_directory, SOURCE_CSV)
     return frame, {
         "url": SOURCE_CSV,
         "etag": response.headers.get("ETag"),
@@ -209,7 +212,7 @@ def validate(candidate: pd.DataFrame, existing: pd.DataFrame | None = None) -> d
 def refresh(output: Path = DEFAULT_OUTPUT, dry_run: bool = False, geocode: bool = True) -> dict:
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=Retry(total=2, backoff_factor=1, status_forcelist=[429, 502, 503, 504])))
-    source, source_meta = download_source(session)
+    source, source_meta = download_source(session, None if dry_run else output.parent / "source_archives")
     existing = pd.read_csv(output, dtype={"Zip": str, "Apn": str}) if output.exists() else None
     candidate = attach_known_coordinates(normalize_source(source), existing)
     cache = _load_cache()

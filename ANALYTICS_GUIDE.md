@@ -2,6 +2,14 @@
 
 The combined site's **Mathematical methods** navigation page (`/methods`) contains the shared code-grounded reference for ALPHA and BETA, including calibrated XGBoost, ridge logistic regression, monthly OLS and their approximate uncertainty methods. It distinguishes forecasting from descriptive scores and display encodings, and offers a Markdown download of all formulas. ALPHA's Methods & resources and BETA's Mathematical methods view point to the same reference, maintained in `methods_ui.py`.
 
+## Model-data readiness
+
+BETA's **Model data & validation** view contains a downloadable acquisition/validation guide, building crosswalk and dated-attribute templates, and an import reviewer. The reviewer requires known building IDs, source references, effective dates and availability dates. It excludes versions not known at origin, rejects duplicate versions and invalid unit counts, and preserves unmatched IDs. This is structural review, not verification of source truth or a new model feature. APNs, buildings and units must remain separate; total residential units are not automatically rental units.
+
+`data_refresh.py` archives exact source payloads on non-dry-run downloads before the production replacement checks, including a stale source retained only for comparison. `model_data.py` compresses/deduplicates payloads by SHA-256 and logs every capture in SQLite. The October 15, 2026 local baseline is observed availability only, not the original publication date. With successive changed extracts, first-observed minus received-date delays can be measured; first-capture identities are left-censored and excluded. Corrections can appear as new identities without stable source IDs. No maturity buffer is yet estimated/applied, no scheduler is added, and cloud local disks need durable backup. Archives are excluded from Git.
+
+The current predictor still uses the same 15 notice-history features. New building attributes, ZIP-rent vintages, reporting-delay buffers, and truly prospective evaluation remain acquisition/development work—not demonstrated improvements. The guide specifies chronological availability gates, notice counts alongside per-unit intensity, and freezing forecasts before a future 90-day window plus maturity buffer. More retrospective tuning cannot create an untouched future test or establish 95% precision.
+
 ## Counts and dates
 
 The source is the Los Angeles Housing Department (LAHD), not the separate housing authority. A source row represents a reported notice record. It does not establish a completed eviction, a unique household, or a number of people displaced. The importer currently removes exact duplicate rows; identical notices cannot always be distinguished without a stable source identifier.

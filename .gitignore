@@ -8,3 +8,4 @@ data/*.previous.csv
 data/*.next.csv
 data/geocode_cache.csv
 data/refresh_metadata.json
+data/source_archives/
