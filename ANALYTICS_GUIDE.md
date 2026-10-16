@@ -10,6 +10,10 @@ BETA's **Model data & validation** view contains a downloadable acquisition/vali
 
 The predictor now compares the original 15 features with five additional activity features; the enriched 20-feature variant passed earlier promotion checks. Actual county parcel data, LAHD enforcement cases and a current Zillow vintage are downloaded, but excluded from historical fitting because historical publication dates and verified building/rental-unit links are missing. Current context is inspectable, not a claimed predictor improvement. No ownership-change data was obtained. Reporting buffers and genuinely future evaluation remain pending. Older-ending source snapshots are archived but excluded from delay statistics and production replacement.
 
+## Separate parcel-month pilot
+
+The Property-month pilot uses an official planning selected-area RSO layer, not a full-city rental universe. Monthly rows include zero-observed notice months and previously unobserved parcels within that cohort; they are not verified true negatives. Exact normalized APNs resolve parcels, not buildings/units/owners. Past count windows end at each month-end origin; 90-day observed-notice labels are null when follow-up exceeds the extract. Current inventory membership and RSO unit counts are not verified historical exposure, so every training target is null and training is disabled. Court filing/judgment/writ/lockout and historical owner-network columns are unknown, not zero. The existing recurrence model is unchanged. `PANEL_ROADMAP.md` documents requirements and temporal purging for overlapping monthly 90-day labels.
+
 ## Counts and dates
 
 The source is the Los Angeles Housing Department (LAHD), not the separate housing authority. A source row represents a reported notice record. It does not establish a completed eviction, a unique household, or a number of people displaced. The importer currently removes exact duplicate rows; identical notices cannot always be distinguished without a stable source identifier.

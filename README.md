@@ -7,6 +7,8 @@ A pair of local, interactive Los Angeles eviction-notice applications that share
 
 ## Included features
 
+**Property-month pilot** is a separate BETA view: 954,495 APN-month rows across 21,211 official selected-area RSO parcels, including 14,734 with no observed notices. This is not a full-city rental universe. Current inventory/exposure cannot be backdated; court and ownership stages are unknown. All pilot training labels are disabled. Existing forecasts are unchanged. See `PANEL_ROADMAP.md` and `data/property_panel/audit.json`; rebuild using `fetch_rso_panel.py --build-only`.
+
 BETA's **Model data & validation** view provides source links, building crosswalk/dated-attribute CSV templates, point-in-time import review and a prospective evaluation guide. Non-dry-run LAHD refreshes archive exact downloaded payloads under `data/source_archives/`, gzip-compressed and deduplicated by SHA-256, with capture observations in SQLite. The local archive is ignored by Git and must be backed up to durable storage. Dry runs do not archive. A local baseline was observed on October 15, 2026; it does not establish historical publication dates. With multiple changed captures, the UI can measure first-observed minus received-date delays, excluding left-censored baseline identities. Record corrections and missing stable notice IDs limit this proxy. These tools do **not** yet add building attributes or a delay buffer to the production predictor.
 
 - Cluster, individual-point, heatmap, 3D-building, and neighborhood choropleth map modes

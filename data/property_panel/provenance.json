@@ -1,0 +1,24 @@
+{
+  "source": "https://services1.arcgis.com/tzwalEyxl2rpamKs/ArcGIS/rest/services/LAHD_RSO_May2025_AssessorParcels/FeatureServer/17",
+  "observed_at": "2026-10-16T17:57:28.885268+00:00",
+  "source_rows": 21211,
+  "scope": "Official planning selected-area RSO layer (selectionTOD); NOT a citywide rental-property universe",
+  "fields": [
+    "OBJECTID",
+    "APN",
+    "RSO_Year",
+    "Address",
+    "City",
+    "Zip",
+    "RSO_Units",
+    "Council_District"
+  ],
+  "sha256": "1100b0f8fe478a6d4fe18e4820766d4ccc1be18a7a8e224ad1bc277849699b11",
+  "unknowns": [
+    "Historic membership dates",
+    "Citywide/non-RSO rental coverage",
+    "Verified building IDs",
+    "Historic owners",
+    "Court outcomes"
+  ]
+}

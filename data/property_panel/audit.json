@@ -1,0 +1,38 @@
+{
+  "grain": "APN \u00d7 month-end; parcel, not verified building or unit",
+  "inventory_source_rows": 21211,
+  "inventory_invalid_apn_rows": 0,
+  "universe_apns": 21211,
+  "universe_apns_with_observed_notice": 6477,
+  "universe_apns_without_observed_notice": 14734,
+  "notice_rows": 309010,
+  "notice_invalid_apn_rows": 131,
+  "notice_rows_matched_to_subset": 49523,
+  "notice_rows_outside_subset": 259356,
+  "notice_invalid_date_rows": 0,
+  "inventory_missing_unit_apns": 0,
+  "ambiguous_unit_apns": 0,
+  "panel_rows": 954495,
+  "monthly_origins": 45,
+  "source_first_received": "2023-01-17",
+  "source_last_received": "2026-09-28",
+  "inventory_observed_at": "2026-10-16T17:57:28.885268+00:00",
+  "training_eligible_rows": 0,
+  "missing_stages": [
+    "UD filing",
+    "judgment",
+    "writ",
+    "lockout",
+    "historical owner/network"
+  ],
+  "limitations": [
+    "Selected-area RSO subset, not all LA rentals or all RSO properties.",
+    "Current inventory cohort creates survivorship/selection risks when projected backward.",
+    "Observed zeros are not verified true negatives; extract completeness and historic membership are unverified.",
+    "Current RSO unit counts are not historic exposure denominators.",
+    "Notice event dates reconstruct history; original publication-time availability remains unknown.",
+    "No new model is trained on this pilot; existing recurrence predictor is unchanged."
+  ],
+  "notice_source_sha256": "343bcb450611425e0b4076d30c4aba71d5dbb954dc75f6fa021be84c47991190",
+  "inventory_sha256": "1100b0f8fe478a6d4fe18e4820766d4ccc1be18a7a8e224ad1bc277849699b11"
+}

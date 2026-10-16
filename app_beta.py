@@ -327,6 +327,7 @@ view_options = [
     "Predictive risk (experimental)",
     "Data quality",
     "Model data & validation",
+    "Property-month pilot",
     "Mathematical methods",
 ]
 selected_view = st.radio("Analysis view", view_options, horizontal=True, label_visibility="collapsed")
@@ -669,6 +670,10 @@ elif selected_view == "Data quality":
         - Rent owed is reported in the source and is not independently verified.
         """
     )
+
+elif selected_view == "Property-month pilot":
+    from property_panel_ui import render_property_panel
+    render_property_panel()
 
 elif selected_view == "Model data & validation":
     from model_data_ui import render_model_data
